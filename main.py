@@ -7,8 +7,8 @@ import matplotlib.pyplot as plt
 import matplotlib
 import cv2
 from filters.notch_filters import IdealNotchFilter, ButterworthNotchFilter, GaussianNotchFilter
-import os 
-from ctypes import *
+import os
+import sys
 
 if not os.path.exists('tmp'):
     os.makedirs('tmp')
@@ -19,7 +19,12 @@ def set_plot_title(title, fs = 16):
 class MainApp:
     def __init__(self):
         #Seeting up root
-        windll.shcore.SetProcessDpiAwareness(1)
+        if sys.platform == "win32":
+            try:
+                from ctypes import windll
+                windll.shcore.SetProcessDpiAwareness(1)
+            except (AttributeError, OSError):
+                pass
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.5) # To get bigger window on higher resolution displays
         self.root.resizable(0, 0)
