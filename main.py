@@ -5,10 +5,11 @@ from PIL import Image, ImageTk, ImageOps
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib
-import cv2
 from filters.notch_filters import IdealNotchFilter, ButterworthNotchFilter, GaussianNotchFilter
-import os 
-from ctypes import *
+from analysis.frequency import compute_fshift, compute_log_magnitude, save_dft_image
+from bio_io.bio_images import load_image, save_slice_png
+import os
+import sys
 
 if not os.path.exists('tmp'):
     os.makedirs('tmp')
@@ -19,12 +20,18 @@ def set_plot_title(title, fs = 16):
 class MainApp:
     def __init__(self):
         #Seeting up root
-        windll.shcore.SetProcessDpiAwareness(1)
+        if sys.platform == "win32":
+            try:
+                from ctypes import windll
+                windll.shcore.SetProcessDpiAwareness(1)
+            except (AttributeError, OSError):
+                pass
         self.root = tk.Tk()
         self.root.tk.call('tk', 'scaling', 1.5) # To get bigger window on higher resolution displays
         self.root.resizable(0, 0)
         self.root.title("Notch Filter")
         self.root.iconphoto(False, tk.PhotoImage(file = pathlib.Path("imgs/icon.png")))
+        self.image_info = None
         #setting up left side of GUI
         self.left_frame = tk.LabelFrame(text = "Original Image")
         self.left_frame.columnconfigure(0)
@@ -35,6 +42,7 @@ class MainApp:
         self.left_frame.rowconfigure(3)
         self.left_frame.rowconfigure(4)
         self.left_frame.rowconfigure(5)
+        self.left_frame.rowconfigure(6)
         self.original_img = tk.Label(self.left_frame, image = "", text = "Load an image \n to preview it here!", padx = 150, pady = 150)
         self.btn_browse_img = tk.Button(self.left_frame, text = "Browse Image", bg = "lightblue", command = self.browse_img)
         self.btn_apply_filter = tk.Button(self.left_frame, text = "Apply Filter", bg = "lightblue", command = self.apply_filter)
@@ -44,6 +52,7 @@ class MainApp:
         self.number_of_points = tk.Entry(self.left_frame)
         self.frequency = tk.Entry(self.left_frame)
         self.butterworth_order = tk.Entry(self.left_frame)
+        self.slice_index = tk.Entry(self.left_frame)
         self.original_img.grid(row = 0, column = 0, columnspan = 2)
         self.btn_browse_img.grid(row = 1, column = 0, sticky='nsew')
         self.btn_apply_filter.grid(row = 1, column = 1, sticky='nsew')
@@ -58,6 +67,10 @@ class MainApp:
         tk.Label(self.left_frame, text = "Order of \n Butterworth Filter").grid(row = 5, column = 0, sticky = 'nsew')
         self.butterworth_order.grid(row = 5, column = 1, sticky = 'nsew')
         self.butterworth_order.insert(tk.END, 1)
+        self.slice_label = tk.Label(self.left_frame, text = "Slice Index (3D only): ")
+        self.slice_label.grid(row = 6, column = 0, sticky = 'nsew')
+        self.slice_index.grid(row = 6, column = 1, sticky = 'nsew')
+        self.slice_index.insert(tk.END, '0')
         self.left_frame.pack(side = "left", fill = tk.Y)
         #setting up Right side of GUI
         self.right_frame = tk.LabelFrame(text = "Filtered Image")
@@ -73,23 +86,51 @@ class MainApp:
         
     def browse_img(self):
         try:
-            file = filedialog.askopenfilename(title = "Load Image", filetypes=[('Images', ['*jpeg','*png','*jpg'])]) 
-            file = ImageOps.grayscale((Image.open(file)))
-            file.save(pathlib.Path("tmp/original_img.png"))
-            file = ImageTk.PhotoImage(file)
-            self.original_img.configure(text = "", image = file)
+            file = filedialog.askopenfilename(
+                title = "Load Image",
+                filetypes=[
+                    ('All supported', '*.png *.jpg *.jpeg *.nii *.nii.gz *.mhd *.mha *.raw'),
+                    ('Standard images', '*.png *.jpg *.jpeg'),
+                    ('NIfTI', '*.nii *.nii.gz'),
+                    ('MetaImage', '*.mhd *.mha *.raw'),
+                ],
+            )
+            if not file:
+                return
+
+            slice_value = self.slice_index.get().strip()
+            slice_index = int(slice_value) if slice_value else None
+            image_array, self.image_info = load_image(file, slice_index=slice_index)
+            save_slice_png(image_array, pathlib.Path("tmp/original_img.png"))
+            preview = Image.open(pathlib.Path("tmp/original_img.png"))
+            preview = ImageTk.PhotoImage(preview)
+            self.original_img.configure(text = "", image = preview)
             self.original_img.text = ""
-            self.original_img.image = file
+            self.original_img.image = preview
+
+            if self.image_info["is_volume"]:
+                self.slice_label.configure(
+                    text = f"Slice Index (0-{self.image_info['volume_shape'][0] - 1}): "
+                )
+                self.slice_index.delete(0, tk.END)
+                self.slice_index.insert(tk.END, str(self.image_info["slice_index"]))
         except Exception as e:
             messagebox.showerror("An error occured !", e)
 
     def get_fshift_and_save_dft(self):
-        img = Image.open(pathlib.Path("tmp/original_img.png"))
-        img = np.asarray(img)
-        f = np.fft.fft2(img)
-        fshift = np.fft.fftshift(f)
-        dft = 20 * np.log(np.abs(fshift))
-        matplotlib.image.imsave(pathlib.Path("tmp/dft.png"), dft, cmap = "gray")
+        slice_value = self.slice_index.get().strip()
+        if self.image_info and self.image_info["is_volume"] and self.image_info["source_path"]:
+            slice_index = int(slice_value) if slice_value else self.image_info["slice_index"]
+            image_array, self.image_info = load_image(
+                self.image_info["source_path"],
+                slice_index=slice_index,
+            )
+            save_slice_png(image_array, pathlib.Path("tmp/original_img.png"))
+
+        img = np.asarray(ImageOps.grayscale(Image.open(pathlib.Path("tmp/original_img.png"))), dtype=np.float64)
+        fshift = compute_fshift(img)
+        dft = compute_log_magnitude(fshift)
+        save_dft_image(dft, pathlib.Path("tmp/dft.png"))
         return fshift, dft
                 
     def apply_filter(self):
@@ -122,18 +163,23 @@ class MainApp:
             
     def save_img(self):
         try:
-            directory = filedialog.asksaveasfilename(title = "Save Image", filetypes=[('Images',['*jpeg','*png','*jpg'])])
+            directory = filedialog.asksaveasfilename(
+                title = "Save Image",
+                filetypes=[
+                    ('PNG', '*.png'),
+                    ('JPEG', '*.jpg *.jpeg'),
+                    ('NIfTI', '*.nii *.nii.gz'),
+                ],
+            )
+            if not directory:
+                return
             Image.open(pathlib.Path("tmp/filtered_img.png")).save(directory)
         except Exception as e:
             messagebox.showerror("An error occured!", e)        
             
     def save_dft(self, path, save_path):
-        img = ImageOps.grayscale((Image.open(path)))
-        img = np.asarray(img)
-        f = np.fft.fft2(img)
-        fshift = np.fft.fftshift(f)
-        dft = 20 * np.log(np.abs(fshift))
-        matplotlib.image.imsave(save_path, dft, cmap = "gray")
+        img = np.asarray(ImageOps.grayscale(Image.open(path)), dtype=np.float64)
+        save_dft_image(compute_log_magnitude(compute_fshift(img)), save_path)
         
     def show_summary(self):
         f, axarr = plt.subplots(2,2)
