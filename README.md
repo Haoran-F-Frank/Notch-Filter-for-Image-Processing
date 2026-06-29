@@ -6,7 +6,26 @@ Three varients of the Notch Filters are implemented:
 # How to run 
   1. Clone this repo. 
   2. Fulfill ```requirements.txt``` (```pip install -r requirements.txt```).
-  3. Run with command ```python main.py```.
+  3. Run GUI with command ```python3 main.py```.
+  4. Run interactive MHD portal with ```python3 portal.py```.
+
+# MHD Interactive Filter Portal
+
+`portal.py` is an interactive tool for `.mhd` / `.mha` / `.raw` biomedical images:
+
+- Load an MHD volume and choose a slice
+- Create, move, delete, and duplicate notch filters
+- Filter types: `0 = Butterworth`, `1 = Gaussian`
+- Butterworth order is adjustable per filter
+- Click or drag on the frequency spectrum to position each filter point
+- Preview filtered result side-by-side with original image and spectrum
+- Save filtered slice as PNG
+
+```bash
+pip install -r requirements.txt
+python3 portal.py
+```
+
 # Demo Run
 
 1. Running ```main.py``` will give follwing screen:

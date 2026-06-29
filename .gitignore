@@ -1,3 +1,5 @@
 tmp/
 .vscode/
-filters/__pycache__
+__pycache__/
+filters/__pycache__/
+bio_io/__pycache__/
