@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import argparse
 import pathlib
 import sys
 import tkinter as tk
@@ -9,7 +10,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image
 
-from bio_io.mhd_loader import AXIS_LABELS, load_mhd_slice, normalize_to_uint8, save_slice_png
+from bio_io.mhd_loader import AXIS_LABELS, load_mhd_slice, save_slice_png, window_to_uint8
 from filters.notch_core import (
     FILTER_TYPE_BUTTERWORTH,
     FILTER_TYPE_GAUSSIAN,
@@ -21,7 +22,7 @@ from filters.notch_core import (
 
 
 class FilterPortalApp:
-    def __init__(self):
+    def __init__(self, intensity_min=-500.0, intensity_max=1000.0, auto_intensity=False):
         if sys.platform == "win32":
             try:
                 from ctypes import windll
@@ -52,6 +53,9 @@ class FilterPortalApp:
         self._last_filtered = None
         self._large_view_window = None
         self._max_zoom = 50.0
+        self.intensity_min_var = tk.StringVar(value=str(intensity_min))
+        self.intensity_max_var = tk.StringVar(value=str(intensity_max))
+        self.auto_intensity_var = tk.BooleanVar(value=auto_intensity)
 
         self._build_layout()
         self._axis_trace_ready = True
@@ -117,6 +121,27 @@ class FilterPortalApp:
             command=self.on_slice_scale_changed,
         )
         self.slice_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
+
+        intensity_bar = tk.Frame(self.root)
+        intensity_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(intensity_bar, text="Intensity Min:").pack(side=tk.LEFT)
+        tk.Entry(intensity_bar, textvariable=self.intensity_min_var, width=8).pack(side=tk.LEFT, padx=4)
+        tk.Label(intensity_bar, text="Max:").pack(side=tk.LEFT)
+        tk.Entry(intensity_bar, textvariable=self.intensity_max_var, width=8).pack(side=tk.LEFT, padx=4)
+        tk.Checkbutton(
+            intensity_bar,
+            text="Auto intensity (use slice min/max)",
+            variable=self.auto_intensity_var,
+            command=self.apply_intensity,
+        ).pack(side=tk.LEFT, padx=8)
+        tk.Button(intensity_bar, text="Apply Intensity", command=self.apply_intensity).pack(side=tk.LEFT, padx=4)
+        tk.Button(
+            intensity_bar,
+            text="Preset -500/1000",
+            command=lambda: self._set_intensity_preset(-500, 1000),
+        ).pack(side=tk.LEFT, padx=4)
+        self.data_range_label = tk.Label(intensity_bar, text="Data range: N/A")
+        self.data_range_label.pack(side=tk.LEFT, padx=12)
 
         body = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -188,9 +213,10 @@ class FilterPortalApp:
             "3. Ctrl + mouse wheel (or Zoom +/-) to enlarge the image for tiny noise details.\n"
             "4. Set Zoom target to 'filtered' to zoom the right panel only.\n"
             "5. Use 'Large Filtered View' for a bigger popup window.\n"
-            "6. Click on the spectrum to move the selected filter point.\n"
-            "7. Type 0 = Butterworth, 1 = Gaussian.\n"
-            "8. Press Preview to update filtered image."
+            "7. Adjust Intensity Min/Max (e.g. -500 to 1000) for noisy CT-like display.\n"
+            "8. Click on the spectrum to move the selected filter point.\n"
+            "9. Type 0 = Butterworth, 1 = Gaussian.\n"
+            "10. Press Preview to update filtered image."
         )
         tk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=300).pack(anchor="w", padx=8, pady=8)
 
@@ -322,6 +348,63 @@ class FilterPortalApp:
         xdata = xlim[0] + rel_x * (xlim[1] - xlim[0])
         ydata = ylim[0] + (1 - rel_y) * (ylim[1] - ylim[0])
         return xdata, ydata
+
+    def _get_intensity_window(self):
+        if self.auto_intensity_var.get():
+            return None, None
+        try:
+            window_min = float(self.intensity_min_var.get())
+            window_max = float(self.intensity_max_var.get())
+        except ValueError as error:
+            raise ValueError("Intensity Min/Max must be numbers.") from error
+        if window_max <= window_min:
+            raise ValueError("Intensity Max must be greater than Min.")
+        return window_min, window_max
+
+    def _to_display_uint8(self, array):
+        window_min, window_max = self._get_intensity_window()
+        return window_to_uint8(array, window_min, window_max)
+
+    def _set_intensity_preset(self, window_min, window_max):
+        self.auto_intensity_var.set(False)
+        self.intensity_min_var.set(str(window_min))
+        self.intensity_max_var.set(str(window_max))
+        self.apply_intensity()
+
+    def _update_data_range_label(self):
+        if self.slice_image is None:
+            self.data_range_label.config(text="Data range: N/A")
+            return
+        minimum = float(self.slice_image.min())
+        maximum = float(self.slice_image.max())
+        self.data_range_label.config(text=f"Data range: {minimum:.1f} to {maximum:.1f}")
+
+    def apply_intensity(self):
+        if self.slice_image is None:
+            return
+        try:
+            self._get_intensity_window()
+        except ValueError as error:
+            messagebox.showerror("Invalid intensity window", str(error))
+            return
+        self._draw_original()
+        if self._last_filtered is not None:
+            self._draw_filtered(self._last_filtered)
+        self._update_intensity_status()
+        if self._large_view_window is not None and self._large_view_window.winfo_exists():
+            self._refresh_large_filtered_view()
+        self.canvas.draw_idle()
+
+    def _update_intensity_status(self):
+        if self.slice_image is None:
+            return
+        base = self.status_var.get().split(" | intensity=")[0].split(" | zoom=")[0]
+        if self.auto_intensity_var.get():
+            intensity_text = "auto"
+        else:
+            intensity_text = f"{self.intensity_min_var.get()}..{self.intensity_max_var.get()}"
+        zoom = self._axis_zoom.get(id(self.ax_filtered), 1.0)
+        self.status_var.set(f"{base} | intensity={intensity_text} | zoom={zoom:.1f}x")
 
     def _current_axis(self):
         return int(self.axis_var.get())
@@ -795,6 +878,7 @@ class FilterPortalApp:
             self.slice_shape = self.slice_image.shape
             height, width = self.slice_shape
             self._sync_slice_controls(slice_index)
+            self._update_data_range_label()
 
             self.fshift_base = compute_fshift(self.slice_image)
             self.log_spectrum = compute_log_magnitude(self.fshift_base)
@@ -827,7 +911,7 @@ class FilterPortalApp:
         axis_label = AXIS_LABELS.get(axis, str(axis))
         self._display_image(
             self.ax_original,
-            normalize_to_uint8(self.slice_image),
+            self._to_display_uint8(self.slice_image),
             f"Original Slice [{axis_label}]",
         )
 
@@ -845,7 +929,7 @@ class FilterPortalApp:
             )
         self._display_image(
             self.ax_filtered,
-            normalize_to_uint8(filtered_image),
+            self._to_display_uint8(filtered_image),
             "Filtered Slice",
         )
 
@@ -901,12 +985,9 @@ class FilterPortalApp:
             self.update_markers()
             self.canvas.draw_idle()
             self._update_zoom_status()
+            self._update_intensity_status()
             if self._large_view_window is not None and self._large_view_window.winfo_exists():
                 self._refresh_large_filtered_view()
-            active_count = sum(1 for item in self.filters if item.enabled)
-            base = self.status_var.get().split(" | zoom=")[0]
-            zoom = self._axis_zoom.get(id(self.ax_filtered), 1.0)
-            self.status_var.set(f"{base} | active_filters={active_count} | zoom={zoom:.1f}x")
         except Exception as error:
             messagebox.showerror("Preview failed", str(error))
 
@@ -986,7 +1067,7 @@ class FilterPortalApp:
             self._large_view_window = None
             return
 
-        image = normalize_to_uint8(self._last_filtered)
+        image = self._to_display_uint8(self._last_filtered)
         height, width = image.shape
         ax = self._large_view_ax
         ax.clear()
@@ -1067,7 +1148,8 @@ class FilterPortalApp:
             raise ValueError(
                 f"Filtered shape {filtered.shape} does not match slice shape {self.slice_shape}"
             )
-        save_slice_png(filtered, path)
+        window_min, window_max = self._get_intensity_window()
+        save_slice_png(filtered, path, window_min=window_min, window_max=window_max)
         messagebox.showinfo("Saved", f"Filtered image saved to:\n{path}")
 
     def run(self):
@@ -1075,8 +1157,31 @@ class FilterPortalApp:
 
 
 def main():
+    parser = argparse.ArgumentParser(description="MHD notch filter interactive portal")
+    parser.add_argument(
+        "--intensity-min",
+        type=float,
+        default=-500.0,
+        help="Display intensity window minimum (default: -500)",
+    )
+    parser.add_argument(
+        "--intensity-max",
+        type=float,
+        default=1000.0,
+        help="Display intensity window maximum (default: 1000)",
+    )
+    parser.add_argument(
+        "--auto-intensity",
+        action="store_true",
+        help="Use each slice's min/max for display instead of a fixed window",
+    )
+    args = parser.parse_args()
     pathlib.Path("tmp").mkdir(exist_ok=True)
-    FilterPortalApp().run()
+    FilterPortalApp(
+        intensity_min=args.intensity_min,
+        intensity_max=args.intensity_max,
+        auto_intensity=args.auto_intensity,
+    ).run()
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ Three varients of the Notch Filters are implemented:
 - Butterworth order is adjustable per filter
 - Click or drag on the frequency spectrum to position each filter point
 - Mouse wheel scrolls through slices; Ctrl + mouse wheel zooms the image view
+- Adjust display intensity window (default -500 to 1000) without changing FFT/filter data
 - Preview filtered result side-by-side with original image and spectrum
 - Save filtered slice as PNG
 - Display keeps the original slice aspect ratio (non-square images are not stretched)

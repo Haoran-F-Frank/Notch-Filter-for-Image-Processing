@@ -64,5 +64,16 @@ def normalize_to_uint8(array):
     return scaled.astype(np.uint8)
 
 
-def save_slice_png(array, path):
-    Image.fromarray(normalize_to_uint8(array)).save(path)
+def window_to_uint8(array, window_min=None, window_max=None):
+    array = array.astype(np.float64)
+    if window_min is None or window_max is None:
+        return normalize_to_uint8(array)
+    if window_max <= window_min:
+        window_max = window_min + 1.0
+    clipped = np.clip(array, window_min, window_max)
+    scaled = (clipped - window_min) / (window_max - window_min) * 255.0
+    return scaled.astype(np.uint8)
+
+
+def save_slice_png(array, path, window_min=None, window_max=None):
+    Image.fromarray(window_to_uint8(array, window_min, window_max)).save(path)
