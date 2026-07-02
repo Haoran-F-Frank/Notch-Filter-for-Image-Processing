@@ -19,6 +19,7 @@ Three varients of the Notch Filters are implemented:
 - Filter types: `0 = Butterworth`, `1 = Gaussian`
 - Butterworth order is adjustable per filter
 - Click or drag on the frequency spectrum to position each filter point
+- Mouse wheel scrolls through slices; Ctrl + mouse wheel zooms the image view
 - Preview filtered result side-by-side with original image and spectrum
 - Save filtered slice as PNG
 - Display keeps the original slice aspect ratio (non-square images are not stretched)

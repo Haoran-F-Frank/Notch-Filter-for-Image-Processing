@@ -41,6 +41,10 @@ class FilterPortalApp:
         self.filters = []
         self.selected_filter_index = None
         self.dragging = False
+        self.volume_shape = None
+        self._base_limits = {}
+        self._axis_zoom = {}
+        self._ctrl_pressed = False
 
         self._build_layout()
         self._create_default_filter()
@@ -60,12 +64,14 @@ class FilterPortalApp:
             width=4,
         )
         self.axis_menu.pack(side=tk.LEFT, padx=4)
+        self.axis_menu.bind("<<ComboboxSelected>>", self.on_axis_changed)
         tk.Label(toolbar, text="Slice:").pack(side=tk.LEFT)
         self.slice_var = tk.StringVar(value="0")
         tk.Entry(toolbar, textvariable=self.slice_var, width=6).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Load Slice", command=self.reload_slice).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Preview", command=self.preview).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Save Filtered PNG", command=self.save_filtered).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Reset Zoom", command=self.reset_zoom).pack(side=tk.LEFT, padx=4)
         self.status_var = tk.StringVar(value="Load an MHD file to begin.")
         tk.Label(toolbar, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=12)
 
@@ -135,10 +141,11 @@ class FilterPortalApp:
         help_text = (
             "Tips:\n"
             "1. Use Axis to switch slice direction (0=Z/axial, 1=Y/coronal, 2=X/sagittal).\n"
-            "2. Click on the spectrum to move the selected filter point.\n"
-            "3. Drag the red marker to fine-tune position.\n"
-            "4. Type 0 = Butterworth, 1 = Gaussian.\n"
-            "5. Press Preview to update filtered image."
+            "2. Mouse wheel: scroll through slices (after MHD is loaded).\n"
+            "3. Ctrl + mouse wheel: zoom in/out on the image under cursor.\n"
+            "4. Click on the spectrum to move the selected filter point.\n"
+            "5. Type 0 = Butterworth, 1 = Gaussian.\n"
+            "6. Press Preview to update filtered image."
         )
         tk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=300).pack(anchor="w", padx=8, pady=8)
 
@@ -171,6 +178,162 @@ class FilterPortalApp:
         self.canvas.mpl_connect("button_press_event", self.on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self.on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self.on_canvas_release)
+        self.canvas.mpl_connect("scroll_event", self.on_canvas_scroll)
+
+        canvas_widget = self.canvas.get_tk_widget()
+        canvas_widget.bind("<MouseWheel>", self.on_tk_mousewheel, add="+")
+        canvas_widget.bind("<Button-4>", self.on_tk_mousewheel, add="+")
+        canvas_widget.bind("<Button-5>", self.on_tk_mousewheel, add="+")
+        canvas_widget.bind("<Control-MouseWheel>", self.on_tk_mousewheel, add="+")
+        canvas_widget.bind("<Control-Button-4>", self.on_tk_mousewheel, add="+")
+        canvas_widget.bind("<Control-Button-5>", self.on_tk_mousewheel, add="+")
+
+        self.root.bind("<Control_L>", self._on_ctrl_press, add="+")
+        self.root.bind("<Control_R>", self._on_ctrl_press, add="+")
+        self.root.bind("<KeyRelease-Control_L>", self._on_ctrl_release, add="+")
+        self.root.bind("<KeyRelease-Control_R>", self._on_ctrl_release, add="+")
+
+    def _on_ctrl_press(self, _event=None):
+        self._ctrl_pressed = True
+
+    def _on_ctrl_release(self, _event=None):
+        self._ctrl_pressed = False
+
+    def _ctrl_is_pressed(self, event=None):
+        if self._ctrl_pressed:
+            return True
+        if event is not None:
+            state = getattr(event, "state", 0)
+            if state & 0x0004 or state & 0x20000:
+                return True
+            key = getattr(event, "key", None)
+            if key and "control" in str(key).lower():
+                return True
+        return False
+
+    def _scroll_direction(self, event):
+        if hasattr(event, "delta") and event.delta:
+            return 1 if event.delta > 0 else -1
+        if hasattr(event, "num") and event.num in (4, 5):
+            return -1 if event.num == 4 else 1
+        step = getattr(event, "step", 0)
+        if step:
+            return 1 if step > 0 else -1
+        return 0
+
+    def on_canvas_scroll(self, event):
+        if event.inaxes not in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+            return
+        direction = self._scroll_direction(event)
+        if direction == 0:
+            return
+        if self._ctrl_is_pressed(event):
+            self._zoom_axes(event.inaxes, direction, event.xdata, event.ydata)
+        else:
+            self._change_slice(direction)
+
+    def on_tk_mousewheel(self, event):
+        direction = self._scroll_direction(event)
+        if direction == 0:
+            return
+        if self._ctrl_is_pressed(event):
+            axis = self._axis_under_pointer(event)
+            if axis is None:
+                return
+            xdata, ydata = self._data_coords_from_tk_event(axis, event)
+            self._zoom_axes(axis, direction, xdata, ydata)
+        else:
+            self._change_slice(direction)
+
+    def _axis_under_pointer(self, event):
+        canvas_widget = self.canvas.get_tk_widget()
+        width = canvas_widget.winfo_width()
+        height = canvas_widget.winfo_height()
+        if width <= 0 or height <= 0:
+            return None
+        rel_x = event.x / width
+        for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+            bbox = axis.get_position()
+            if bbox.x0 <= rel_x <= bbox.x1:
+                return axis
+        return self.ax_original
+
+    def _data_coords_from_tk_event(self, axis, event):
+        canvas_widget = self.canvas.get_tk_widget()
+        width = canvas_widget.winfo_width()
+        height = canvas_widget.winfo_height()
+        if width <= 0 or height <= 0:
+            return None, None
+        bbox = axis.get_position()
+        rel_x = (event.x / width - bbox.x0) / max(bbox.width, 1e-8)
+        rel_y = (event.y / height - bbox.y0) / max(bbox.height, 1e-8)
+        xlim = axis.get_xlim()
+        ylim = axis.get_ylim()
+        xdata = xlim[0] + rel_x * (xlim[1] - xlim[0])
+        ydata = ylim[0] + (1 - rel_y) * (ylim[1] - ylim[0])
+        return xdata, ydata
+
+    def _change_slice(self, direction):
+        if not self.mhd_path or self.volume_shape is None:
+            return
+        axis = self._current_axis()
+        max_slice = self.volume_shape[axis] - 1
+        try:
+            current = int(self.slice_var.get())
+        except ValueError:
+            current = 0
+        new_slice = max(0, min(max_slice, current + direction))
+        if new_slice == current:
+            return
+        self.slice_var.set(str(new_slice))
+        self.reload_slice(reset_zoom=False)
+
+    def reset_zoom(self):
+        self._axis_zoom = {}
+        for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+            self._restore_axis_view(axis)
+        self.canvas.draw_idle()
+
+    def _zoom_axes(self, target_axis, direction, xdata=None, ydata=None):
+        zoom_in = direction > 0
+        for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+            if id(axis) not in self._base_limits:
+                continue
+            center = (xdata, ydata) if axis is target_axis else None
+            self._zoom_single_axis(axis, zoom_in, center=center)
+        self.canvas.draw_idle()
+
+    def _zoom_single_axis(self, axis, zoom_in, center=None):
+        base_xlim, base_ylim = self._base_limits[id(axis)]
+        bx0, bx1 = base_xlim
+        by0, by1 = base_ylim
+
+        current_zoom = self._axis_zoom.get(id(axis), 1.0)
+        if zoom_in:
+            current_zoom = min(20.0, current_zoom * 1.15)
+        else:
+            current_zoom = max(1.0, current_zoom / 1.15)
+        self._axis_zoom[id(axis)] = current_zoom
+
+        if current_zoom <= 1.0:
+            axis.set_xlim(base_xlim)
+            axis.set_ylim(base_ylim)
+            return
+
+        cx = center[0] if center and center[0] is not None else (bx0 + bx1) / 2
+        cy = center[1] if center and center[1] is not None else (by0 + by1) / 2
+
+        cur_xlim = axis.get_xlim()
+        cur_ylim = axis.get_ylim()
+        scale = 1 / 1.15 if zoom_in else 1.15
+        new_width = (cur_xlim[1] - cur_xlim[0]) * scale
+        new_height = abs(cur_ylim[1] - cur_ylim[0]) * scale
+
+        relx = (cx - cur_xlim[0]) / max(cur_xlim[1] - cur_xlim[0], 1e-8)
+        rely = (cur_ylim[0] - cy) / max(cur_ylim[0] - cur_ylim[1], 1e-8)
+
+        axis.set_xlim(cx - new_width * relx, cx + new_width * (1 - relx))
+        axis.set_ylim(cy + new_height * (1 - rely), cy - new_height * rely)
 
     def _display_image(self, axis, image, title):
         height, width = image.shape[:2]
@@ -182,12 +345,34 @@ class FilterPortalApp:
             interpolation="nearest",
             origin="upper",
         )
-        axis.set_xlim(-0.5, width - 0.5)
-        axis.set_ylim(height - 0.5, -0.5)
+        xlim = (-0.5, width - 0.5)
+        ylim = (height - 0.5, -0.5)
+        axis.set_xlim(xlim)
+        axis.set_ylim(ylim)
         axis.set_aspect("equal", adjustable="box")
         axis.set_title(f"{title} ({width} x {height})")
         axis.set_xticks([])
         axis.set_yticks([])
+        self._base_limits[id(axis)] = (xlim, ylim)
+        self._restore_axis_view(axis)
+
+    def _restore_axis_view(self, axis):
+        if id(axis) not in self._base_limits:
+            return
+        base_xlim, base_ylim = self._base_limits[id(axis)]
+        zoom = self._axis_zoom.get(id(axis), 1.0)
+        if zoom <= 1.0:
+            axis.set_xlim(base_xlim)
+            axis.set_ylim(base_ylim)
+            return
+        bx0, bx1 = base_xlim
+        by0, by1 = base_ylim
+        cx = (bx0 + bx1) / 2
+        cy = (by0 + by1) / 2
+        half_w = (bx1 - bx0) / (2 * zoom)
+        half_h = abs(by1 - by0) / (2 * zoom)
+        axis.set_xlim(cx - half_w, cx + half_w)
+        axis.set_ylim(cy + half_h, cy - half_h)
 
     def _resize_figure_for_image(self, height, width):
         pixels_per_inch = self.fig.dpi
@@ -376,16 +561,19 @@ class FilterPortalApp:
         if not path:
             return
         self.mhd_path = path
-        self.reload_slice()
+        self._axis_zoom = {}
+        self.reload_slice(reset_zoom=True)
 
     def _current_axis(self):
         return int(self.axis_var.get())
 
-    def reload_slice(self):
+    def reload_slice(self, reset_zoom=False):
         if not self.mhd_path:
             messagebox.showinfo("Load MHD", "Please load an MHD file first.")
             return
         try:
+            if reset_zoom:
+                self._axis_zoom = {}
             slice_index = int(self.slice_var.get())
             axis = self._current_axis()
             previous_shape = self.slice_shape
@@ -394,6 +582,7 @@ class FilterPortalApp:
                 slice_index=slice_index,
                 axis=axis,
             )
+            self.volume_shape = info["shape"]
             self.slice_shape = self.slice_image.shape
             height, width = self.slice_shape
 
