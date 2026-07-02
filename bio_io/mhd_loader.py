@@ -5,6 +5,13 @@ import SimpleITK as sitk
 from PIL import Image
 
 
+AXIS_LABELS = {
+    0: "0: Z (axial)",
+    1: "1: Y (coronal)",
+    2: "2: X (sagittal)",
+}
+
+
 def load_mhd_slice(path, slice_index=None, axis=0):
     path = pathlib.Path(path)
     if path.suffix.lower() == ".raw":

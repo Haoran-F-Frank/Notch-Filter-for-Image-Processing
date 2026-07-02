@@ -9,7 +9,7 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image
 
-from bio_io.mhd_loader import load_mhd_slice, normalize_to_uint8, save_slice_png
+from bio_io.mhd_loader import AXIS_LABELS, load_mhd_slice, normalize_to_uint8, save_slice_png
 from filters.notch_core import (
     FILTER_TYPE_BUTTERWORTH,
     FILTER_TYPE_GAUSSIAN,
@@ -50,6 +50,16 @@ class FilterPortalApp:
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
         tk.Button(toolbar, text="Load MHD", command=self.load_mhd).pack(side=tk.LEFT, padx=4)
+        tk.Label(toolbar, text="Axis:").pack(side=tk.LEFT)
+        self.axis_var = tk.StringVar(value="0")
+        self.axis_menu = ttk.Combobox(
+            toolbar,
+            textvariable=self.axis_var,
+            values=["0", "1", "2"],
+            state="readonly",
+            width=4,
+        )
+        self.axis_menu.pack(side=tk.LEFT, padx=4)
         tk.Label(toolbar, text="Slice:").pack(side=tk.LEFT)
         self.slice_var = tk.StringVar(value="0")
         tk.Entry(toolbar, textvariable=self.slice_var, width=6).pack(side=tk.LEFT, padx=4)
@@ -124,10 +134,11 @@ class FilterPortalApp:
 
         help_text = (
             "Tips:\n"
-            "1. Click on the spectrum to move the selected filter point.\n"
-            "2. Drag the red marker to fine-tune position.\n"
-            "3. Type 0 = Butterworth, 1 = Gaussian.\n"
-            "4. Press Preview to update filtered image."
+            "1. Use Axis to switch slice direction (0=Z/axial, 1=Y/coronal, 2=X/sagittal).\n"
+            "2. Click on the spectrum to move the selected filter point.\n"
+            "3. Drag the red marker to fine-tune position.\n"
+            "4. Type 0 = Butterworth, 1 = Gaussian.\n"
+            "5. Press Preview to update filtered image."
         )
         tk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=300).pack(anchor="w", padx=8, pady=8)
 
@@ -367,14 +378,22 @@ class FilterPortalApp:
         self.mhd_path = path
         self.reload_slice()
 
+    def _current_axis(self):
+        return int(self.axis_var.get())
+
     def reload_slice(self):
         if not self.mhd_path:
             messagebox.showinfo("Load MHD", "Please load an MHD file first.")
             return
         try:
             slice_index = int(self.slice_var.get())
+            axis = self._current_axis()
             previous_shape = self.slice_shape
-            self.slice_image, _, info = load_mhd_slice(self.mhd_path, slice_index=slice_index)
+            self.slice_image, _, info = load_mhd_slice(
+                self.mhd_path,
+                slice_index=slice_index,
+                axis=axis,
+            )
             self.slice_shape = self.slice_image.shape
             height, width = self.slice_shape
 
@@ -388,9 +407,12 @@ class FilterPortalApp:
 
             self._adapt_filters_to_shape(height, width, previous_shape=previous_shape)
             self._resize_figure_for_image(height, width)
+            axis_label = AXIS_LABELS.get(axis, str(axis))
+            max_slice = info["shape"][axis] - 1
             self.status_var.set(
                 f"Loaded {pathlib.Path(self.mhd_path).name} | volume={info['shape']} | "
-                f"slice={slice_index} | slice_size={width}x{height} | spectrum={width}x{height}"
+                f"axis={axis_label} | slice={slice_index}/{max_slice} | "
+                f"slice_size={width}x{height} | spectrum={width}x{height}"
             )
             self._draw_original()
             self._draw_spectrum()
@@ -402,10 +424,12 @@ class FilterPortalApp:
             messagebox.showerror("Failed to load slice", str(error))
 
     def _draw_original(self):
+        axis = self._current_axis()
+        axis_label = AXIS_LABELS.get(axis, str(axis))
         self._display_image(
             self.ax_original,
             normalize_to_uint8(self.slice_image),
-            "Original Slice",
+            f"Original Slice [{axis_label}]",
         )
 
     def _draw_spectrum(self):

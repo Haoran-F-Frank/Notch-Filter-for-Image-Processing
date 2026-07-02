@@ -14,6 +14,7 @@ Three varients of the Notch Filters are implemented:
 `portal.py` is an interactive tool for `.mhd` / `.mha` / `.raw` biomedical images:
 
 - Load an MHD volume and choose a slice
+- Switch slice direction with **Axis** (0=Z/axial, 1=Y/coronal, 2=X/sagittal)
 - Create, move, delete, and duplicate notch filters
 - Filter types: `0 = Butterworth`, `1 = Gaussian`
 - Butterworth order is adjustable per filter
