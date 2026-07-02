@@ -567,6 +567,10 @@ class FilterPortalApp:
     def _current_axis(self):
         return int(self.axis_var.get())
 
+    def on_axis_changed(self, _event=None):
+        if self.mhd_path:
+            self.reload_slice(reset_zoom=True)
+
     def reload_slice(self, reset_zoom=False):
         if not self.mhd_path:
             messagebox.showinfo("Load MHD", "Please load an MHD file first.")
