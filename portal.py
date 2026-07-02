@@ -48,6 +48,10 @@ class FilterPortalApp:
         self._reload_after_id = None
         self._updating_controls = False
         self._axis_trace_ready = False
+        self._last_hover_axis = None
+        self._last_filtered = None
+        self._large_view_window = None
+        self._max_zoom = 50.0
 
         self._build_layout()
         self._axis_trace_ready = True
@@ -85,6 +89,18 @@ class FilterPortalApp:
         tk.Button(toolbar, text="Preview", command=self.preview).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Save Filtered PNG", command=self.save_filtered).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Reset Zoom", command=self.reset_zoom).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Zoom +", command=lambda: self.zoom_by_button(True)).pack(side=tk.LEFT, padx=2)
+        tk.Button(toolbar, text="Zoom -", command=lambda: self.zoom_by_button(False)).pack(side=tk.LEFT, padx=2)
+        tk.Label(toolbar, text="Zoom target:").pack(side=tk.LEFT, padx=(8, 0))
+        self.zoom_target_var = tk.StringVar(value="filtered")
+        ttk.Combobox(
+            toolbar,
+            textvariable=self.zoom_target_var,
+            values=["filtered", "cursor", "all", "original", "spectrum"],
+            state="readonly",
+            width=10,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Large Filtered View", command=self.open_large_filtered_view).pack(side=tk.LEFT, padx=4)
         self.status_var = tk.StringVar(value="Load an MHD file to begin.")
         tk.Label(toolbar, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=12)
 
@@ -169,10 +185,12 @@ class FilterPortalApp:
             "Tips:\n"
             "1. Use Axis to switch slice direction (0=Z/axial, 1=Y/coronal, 2=X/sagittal).\n"
             "2. Change Slice via entry, slider, ◀▶ buttons, or mouse wheel.\n"
-            "3. Ctrl + mouse wheel: zoom in/out on the image under cursor.\n"
-            "4. Click on the spectrum to move the selected filter point.\n"
-            "5. Type 0 = Butterworth, 1 = Gaussian.\n"
-            "6. Press Preview to update filtered image."
+            "3. Ctrl + mouse wheel (or Zoom +/-) to enlarge the image for tiny noise details.\n"
+            "4. Set Zoom target to 'filtered' to zoom the right panel only.\n"
+            "5. Use 'Large Filtered View' for a bigger popup window.\n"
+            "6. Click on the spectrum to move the selected filter point.\n"
+            "7. Type 0 = Butterworth, 1 = Gaussian.\n"
+            "8. Press Preview to update filtered image."
         )
         tk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=300).pack(anchor="w", padx=8, pady=8)
 
@@ -206,6 +224,7 @@ class FilterPortalApp:
         self.canvas.mpl_connect("motion_notify_event", self.on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self.on_canvas_release)
         self.canvas.mpl_connect("scroll_event", self.on_canvas_scroll)
+        self.canvas.mpl_connect("axes_enter_event", self.on_axes_enter)
 
         canvas_widget = self.canvas.get_tk_widget()
         canvas_widget.bind("<MouseWheel>", self.on_tk_mousewheel, add="+")
@@ -219,6 +238,10 @@ class FilterPortalApp:
         self.root.bind("<Control_R>", self._on_ctrl_press, add="+")
         self.root.bind("<KeyRelease-Control_L>", self._on_ctrl_release, add="+")
         self.root.bind("<KeyRelease-Control_R>", self._on_ctrl_release, add="+")
+
+    def on_axes_enter(self, event):
+        if event.inaxes in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+            self._last_hover_axis = event.inaxes
 
     def _on_ctrl_press(self, _event=None):
         self._ctrl_pressed = True
@@ -255,7 +278,7 @@ class FilterPortalApp:
         if direction == 0:
             return
         if self._ctrl_is_pressed(event):
-            self._zoom_axes(event.inaxes, direction, event.xdata, event.ydata)
+            self._zoom_target_axes(event.inaxes, direction, event.xdata, event.ydata)
         else:
             self._change_slice(direction)
 
@@ -268,7 +291,7 @@ class FilterPortalApp:
             if axis is None:
                 return
             xdata, ydata = self._data_coords_from_tk_event(axis, event)
-            self._zoom_axes(axis, direction, xdata, ydata)
+            self._zoom_target_axes(axis, direction, xdata, ydata)
         else:
             self._change_slice(direction)
 
@@ -392,16 +415,43 @@ class FilterPortalApp:
         self._axis_zoom = {}
         for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
             self._restore_axis_view(axis)
+        self._update_zoom_status()
         self.canvas.draw_idle()
 
-    def _zoom_axes(self, target_axis, direction, xdata=None, ydata=None):
+    def _zoom_target_axes(self, cursor_axis, direction, xdata=None, ydata=None):
+        target = self.zoom_target_var.get()
         zoom_in = direction > 0
-        for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
+        if target == "all":
+            axes = [self.ax_original, self.ax_spectrum, self.ax_filtered]
+        elif target == "filtered":
+            axes = [self.ax_filtered]
+        elif target == "original":
+            axes = [self.ax_original]
+        elif target == "spectrum":
+            axes = [self.ax_spectrum]
+        else:
+            axes = [cursor_axis or self._last_hover_axis or self.ax_filtered]
+
+        for axis in axes:
             if id(axis) not in self._base_limits:
                 continue
-            center = (xdata, ydata) if axis is target_axis else None
+            center = (xdata, ydata) if axis is cursor_axis else None
             self._zoom_single_axis(axis, zoom_in, center=center)
+        self._update_zoom_status()
         self.canvas.draw_idle()
+
+    def zoom_by_button(self, zoom_in):
+        axis = self._last_hover_axis or self.ax_filtered
+        self._zoom_target_axes(axis, 1 if zoom_in else -1)
+
+    def _update_zoom_status(self):
+        zoom = self._axis_zoom.get(id(self.ax_filtered), 1.0)
+        base = self.status_var.get().split(" | zoom=")[0]
+        if self.slice_image is not None:
+            self.status_var.set(f"{base} | zoom={zoom:.1f}x")
+
+    def _zoom_axes(self, target_axis, direction, xdata=None, ydata=None):
+        self._zoom_target_axes(target_axis, direction, xdata, ydata)
 
     def _zoom_single_axis(self, axis, zoom_in, center=None):
         base_xlim, base_ylim = self._base_limits[id(axis)]
@@ -410,9 +460,9 @@ class FilterPortalApp:
 
         current_zoom = self._axis_zoom.get(id(axis), 1.0)
         if zoom_in:
-            current_zoom = min(20.0, current_zoom * 1.15)
+            current_zoom = min(self._max_zoom, current_zoom * 1.2)
         else:
-            current_zoom = max(1.0, current_zoom / 1.15)
+            current_zoom = max(1.0, current_zoom / 1.2)
         self._axis_zoom[id(axis)] = current_zoom
 
         if current_zoom <= 1.0:
@@ -425,7 +475,7 @@ class FilterPortalApp:
 
         cur_xlim = axis.get_xlim()
         cur_ylim = axis.get_ylim()
-        scale = 1 / 1.15 if zoom_in else 1.15
+        scale = 1 / 1.2 if zoom_in else 1.2
         new_width = (cur_xlim[1] - cur_xlim[0]) * scale
         new_height = abs(cur_ylim[1] - cur_ylim[0]) * scale
 
@@ -847,13 +897,110 @@ class FilterPortalApp:
                     f"Filtered shape {filtered.shape} does not match slice shape {self.slice_shape}"
                 )
             self._draw_filtered(filtered)
+            self._last_filtered = filtered
             self.update_markers()
             self.canvas.draw_idle()
-            self.status_var.set(
-                f"Preview updated with {sum(1 for item in self.filters if item.enabled)} active filter(s)."
-            )
+            self._update_zoom_status()
+            if self._large_view_window is not None and self._large_view_window.winfo_exists():
+                self._refresh_large_filtered_view()
+            active_count = sum(1 for item in self.filters if item.enabled)
+            base = self.status_var.get().split(" | zoom=")[0]
+            zoom = self._axis_zoom.get(id(self.ax_filtered), 1.0)
+            self.status_var.set(f"{base} | active_filters={active_count} | zoom={zoom:.1f}x")
         except Exception as error:
             messagebox.showerror("Preview failed", str(error))
+
+    def open_large_filtered_view(self):
+        if self.fshift_base is None:
+            messagebox.showinfo("Large View", "请先加载 MHD 并点击 Preview。")
+            return
+        if self._last_filtered is None:
+            self.preview()
+        if self._last_filtered is None:
+            return
+
+        if self._large_view_window is not None and self._large_view_window.winfo_exists():
+            self._large_view_window.lift()
+            self._refresh_large_filtered_view()
+            return
+
+        window = tk.Toplevel(self.root)
+        window.title("Filtered Image - Large View")
+        window.geometry("900x900")
+        self._large_view_window = window
+
+        fig, ax = plt.subplots(figsize=(9, 9), constrained_layout=True)
+        canvas = FigureCanvasTkAgg(fig, master=window)
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+
+        toolbar = tk.Frame(window)
+        toolbar.pack(fill=tk.X)
+        tk.Label(
+            toolbar,
+            text="Ctrl + 滚轮放大/缩小 | 可查看微小噪声细节",
+        ).pack(side=tk.LEFT, padx=8, pady=4)
+
+        self._large_view_fig = fig
+        self._large_view_ax = ax
+        self._large_view_canvas = canvas
+        self._large_view_zoom = 1.0
+        self._large_view_limits = None
+
+        def on_close():
+            self._large_view_window = None
+            window.destroy()
+
+        window.protocol("WM_DELETE_WINDOW", on_close)
+        self._refresh_large_filtered_view()
+
+        def on_large_scroll(event):
+            direction = self._scroll_direction(event)
+            if not self._ctrl_is_pressed(event) or direction == 0:
+                return
+            if self._large_view_limits is None:
+                return
+            zoom_in = direction > 0
+            if zoom_in:
+                self._large_view_zoom = min(self._max_zoom, self._large_view_zoom * 1.2)
+            else:
+                self._large_view_zoom = max(1.0, self._large_view_zoom / 1.2)
+            bx0, bx1 = self._large_view_limits[0]
+            by0, by1 = self._large_view_limits[1]
+            cx = (bx0 + bx1) / 2
+            cy = (by0 + by1) / 2
+            half_w = (bx1 - bx0) / (2 * self._large_view_zoom)
+            half_h = abs(by1 - by0) / (2 * self._large_view_zoom)
+            ax.set_xlim(cx - half_w, cx + half_w)
+            ax.set_ylim(cy + half_h, cy - half_h)
+            canvas.draw_idle()
+
+        canvas.mpl_connect("scroll_event", on_large_scroll)
+        canvas.get_tk_widget().bind("<Control-MouseWheel>", on_large_scroll, add="+")
+        canvas.get_tk_widget().bind("<Control-Button-4>", on_large_scroll, add="+")
+        canvas.get_tk_widget().bind("<Control-Button-5>", on_large_scroll, add="+")
+
+    def _refresh_large_filtered_view(self):
+        if self._last_filtered is None or self._large_view_window is None:
+            return
+        if not self._large_view_window.winfo_exists():
+            self._large_view_window = None
+            return
+
+        image = normalize_to_uint8(self._last_filtered)
+        height, width = image.shape
+        ax = self._large_view_ax
+        ax.clear()
+        ax.imshow(image, cmap="gray", aspect="equal", interpolation="nearest", origin="upper")
+        xlim = (-0.5, width - 0.5)
+        ylim = (height - 0.5, -0.5)
+        ax.set_xlim(xlim)
+        ax.set_ylim(ylim)
+        ax.set_title(f"Filtered Slice - Large View ({width} x {height})")
+        ax.set_xticks([])
+        ax.set_yticks([])
+        self._large_view_limits = (xlim, ylim)
+        self._large_view_zoom = 1.0
+        self._large_view_canvas.draw_idle()
 
     def apply_parameters_silent(self):
         spec = self.selected_filter()
