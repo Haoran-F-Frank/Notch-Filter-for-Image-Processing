@@ -342,7 +342,7 @@ class FilterPortalApp:
         try:
             if artist.axes is not None:
                 artist.remove()
-        except (ValueError, AttributeError):
+        except (ValueError, AttributeError, NotImplementedError):
             pass
 
     def _clear_markers(self):
