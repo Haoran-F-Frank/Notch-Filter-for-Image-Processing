@@ -45,8 +45,12 @@ class FilterPortalApp:
         self._base_limits = {}
         self._axis_zoom = {}
         self._ctrl_pressed = False
+        self._reload_after_id = None
+        self._updating_controls = False
+        self._axis_trace_ready = False
 
         self._build_layout()
+        self._axis_trace_ready = True
         self._create_default_filter()
 
     def _build_layout(self):
@@ -65,16 +69,38 @@ class FilterPortalApp:
             width=4,
         )
         self.axis_menu.pack(side=tk.LEFT, padx=4)
-        self.axis_menu.bind("<<ComboboxSelected>>", self.on_axis_changed)
-        tk.Label(toolbar, text="Slice:").pack(side=tk.LEFT)
+        self.axis_var.trace_add("write", self._on_axis_var_changed)
+
+        tk.Button(toolbar, text="◀", width=2, command=lambda: self._step_slice(-1)).pack(side=tk.LEFT, padx=(8, 0))
+        tk.Label(toolbar, text="Slice:").pack(side=tk.LEFT, padx=(4, 0))
         self.slice_var = tk.StringVar(value="0")
-        tk.Entry(toolbar, textvariable=self.slice_var, width=6).pack(side=tk.LEFT, padx=4)
-        tk.Button(toolbar, text="Load Slice", command=self.reload_slice).pack(side=tk.LEFT, padx=4)
+        self.slice_entry = tk.Entry(toolbar, textvariable=self.slice_var, width=6)
+        self.slice_entry.pack(side=tk.LEFT, padx=4)
+        self.slice_entry.bind("<Return>", self.on_slice_entry_commit)
+        self.slice_entry.bind("<FocusOut>", self.on_slice_entry_commit)
+        tk.Button(toolbar, text="▶", width=2, command=lambda: self._step_slice(1)).pack(side=tk.LEFT, padx=(0, 4))
+        self.slice_max_label = tk.Label(toolbar, text="/ 0")
+        self.slice_max_label.pack(side=tk.LEFT, padx=(0, 4))
+        tk.Button(toolbar, text="Load Slice", command=lambda: self.reload_slice()).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Preview", command=self.preview).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Save Filtered PNG", command=self.save_filtered).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Reset Zoom", command=self.reset_zoom).pack(side=tk.LEFT, padx=4)
         self.status_var = tk.StringVar(value="Load an MHD file to begin.")
         tk.Label(toolbar, textvariable=self.status_var, anchor="w").pack(side=tk.LEFT, padx=12)
+
+        slice_bar = tk.Frame(self.root)
+        slice_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(slice_bar, text="Slice slider:").pack(side=tk.LEFT)
+        self.slice_scale = tk.Scale(
+            slice_bar,
+            from_=0,
+            to=0,
+            orient=tk.HORIZONTAL,
+            showvalue=True,
+            length=500,
+            command=self.on_slice_scale_changed,
+        )
+        self.slice_scale.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=8)
 
         body = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -142,7 +168,7 @@ class FilterPortalApp:
         help_text = (
             "Tips:\n"
             "1. Use Axis to switch slice direction (0=Z/axial, 1=Y/coronal, 2=X/sagittal).\n"
-            "2. Mouse wheel: scroll through slices (after MHD is loaded).\n"
+            "2. Change Slice via entry, slider, ◀▶ buttons, or mouse wheel.\n"
             "3. Ctrl + mouse wheel: zoom in/out on the image under cursor.\n"
             "4. Click on the spectrum to move the selected filter point.\n"
             "5. Type 0 = Butterworth, 1 = Gaussian.\n"
@@ -274,20 +300,93 @@ class FilterPortalApp:
         ydata = ylim[0] + (1 - rel_y) * (ylim[1] - ylim[0])
         return xdata, ydata
 
-    def _change_slice(self, direction):
+    def _current_axis(self):
+        return int(self.axis_var.get())
+
+    def _max_slice_index(self):
+        if self.volume_shape is None:
+            return 0
+        return max(self.volume_shape[self._current_axis()] - 1, 0)
+
+    def _clamp_slice_index(self, slice_index):
+        return max(0, min(int(slice_index), self._max_slice_index()))
+
+    def _sync_slice_controls(self, slice_index):
+        slice_index = self._clamp_slice_index(slice_index)
+        max_slice = self._max_slice_index()
+        self._updating_controls = True
+        self.slice_var.set(str(slice_index))
+        self.slice_scale.config(to=max_slice)
+        self.slice_scale.set(slice_index)
+        self.slice_max_label.config(text=f"/ {max_slice}")
+        self._updating_controls = False
+        return slice_index
+
+    def _schedule_reload_slice(self, reset_zoom=False, new_orientation=False, delay_ms=60):
+        if self._reload_after_id is not None:
+            self.root.after_cancel(self._reload_after_id)
+
+        def _run():
+            self._reload_after_id = None
+            self.reload_slice(reset_zoom=reset_zoom, new_orientation=new_orientation)
+
+        self._reload_after_id = self.root.after(delay_ms, _run)
+
+    def _step_slice(self, direction):
         if not self.mhd_path or self.volume_shape is None:
             return
-        axis = self._current_axis()
-        max_slice = self.volume_shape[axis] - 1
         try:
             current = int(self.slice_var.get())
         except ValueError:
             current = 0
-        new_slice = max(0, min(max_slice, current + direction))
+        new_slice = self._clamp_slice_index(current + direction)
         if new_slice == current:
             return
-        self.slice_var.set(str(new_slice))
+        self._sync_slice_controls(new_slice)
+        self._schedule_reload_slice(reset_zoom=False)
+
+    def on_slice_entry_commit(self, _event=None):
+        if not self.mhd_path or self._updating_controls:
+            return
+        try:
+            slice_index = self._clamp_slice_index(int(self.slice_var.get()))
+        except ValueError:
+            messagebox.showerror("Invalid slice", "Slice index must be an integer.")
+            self._sync_slice_controls(self.slice_scale.get())
+            return
+        self._sync_slice_controls(slice_index)
         self.reload_slice(reset_zoom=False)
+
+    def on_slice_scale_changed(self, value):
+        if not self.mhd_path or self._updating_controls:
+            return
+        slice_index = self._clamp_slice_index(float(value))
+        self._updating_controls = True
+        self.slice_var.set(str(slice_index))
+        self._updating_controls = False
+        self._schedule_reload_slice(reset_zoom=False)
+
+    def _on_axis_var_changed(self, *_args):
+        if not self._axis_trace_ready or self._updating_controls:
+            return
+        if self.mhd_path and self.volume_shape is not None:
+            self.on_axis_changed()
+
+    def on_axis_changed(self, _event=None):
+        if not self.mhd_path or self.volume_shape is None:
+            return
+        try:
+            current = int(self.slice_var.get())
+        except ValueError:
+            current = 0
+        slice_index = self._clamp_slice_index(current)
+        self._sync_slice_controls(slice_index)
+        self.reload_slice(reset_zoom=True, new_orientation=True)
+
+    def _change_slice(self, direction):
+        if not self.mhd_path or self.volume_shape is None:
+            return
+        self._step_slice(direction)
 
     def reset_zoom(self):
         self._axis_zoom = {}
@@ -594,6 +693,9 @@ class FilterPortalApp:
         self.reload_slice(reset_zoom=True, new_volume=new_file)
 
     def close_mhd(self):
+        if self._reload_after_id is not None:
+            self.root.after_cancel(self._reload_after_id)
+            self._reload_after_id = None
         self._clear_markers()
         self.mhd_path = None
         self.slice_image = None
@@ -617,23 +719,23 @@ class FilterPortalApp:
         self.status_var.set("MHD file closed. Click Load MHD to open another file.")
         self.canvas.draw_idle()
 
-    def _current_axis(self):
-        return int(self.axis_var.get())
+        self.status_var.set("MHD file closed. Click Load MHD to open another file.")
+        self._sync_slice_controls(0)
+        self.canvas.draw_idle()
 
-    def on_axis_changed(self, _event=None):
-        if self.mhd_path:
-            self.reload_slice(reset_zoom=True)
-
-    def reload_slice(self, reset_zoom=False, new_volume=False):
+    def reload_slice(self, reset_zoom=False, new_volume=False, new_orientation=False):
         if not self.mhd_path:
             messagebox.showinfo("Load MHD", "Please load an MHD file first.")
             return
         try:
             if reset_zoom:
                 self._axis_zoom = {}
-            slice_index = int(self.slice_var.get())
+            slice_index = self._clamp_slice_index(int(self.slice_var.get()))
             axis = self._current_axis()
-            previous_shape = None if new_volume else self.slice_shape
+            if new_volume or new_orientation:
+                previous_shape = None
+            else:
+                previous_shape = self.slice_shape
             self.slice_image, _, info = load_mhd_slice(
                 self.mhd_path,
                 slice_index=slice_index,
@@ -642,6 +744,7 @@ class FilterPortalApp:
             self.volume_shape = info["shape"]
             self.slice_shape = self.slice_image.shape
             height, width = self.slice_shape
+            self._sync_slice_controls(slice_index)
 
             self.fshift_base = compute_fshift(self.slice_image)
             self.log_spectrum = compute_log_magnitude(self.fshift_base)
