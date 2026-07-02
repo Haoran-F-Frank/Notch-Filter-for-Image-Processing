@@ -54,6 +54,7 @@ class FilterPortalApp:
         toolbar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=6)
 
         tk.Button(toolbar, text="Load MHD", command=self.load_mhd).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Close MHD", command=self.close_mhd).pack(side=tk.LEFT, padx=4)
         tk.Label(toolbar, text="Axis:").pack(side=tk.LEFT)
         self.axis_var = tk.StringVar(value="0")
         self.axis_menu = ttk.Combobox(
@@ -335,7 +336,24 @@ class FilterPortalApp:
         axis.set_xlim(cx - new_width * relx, cx + new_width * (1 - relx))
         axis.set_ylim(cy + new_height * (1 - rely), cy - new_height * rely)
 
+    def _safe_remove_artist(self, artist):
+        if artist is None:
+            return
+        try:
+            if artist.axes is not None:
+                artist.remove()
+        except (ValueError, AttributeError):
+            pass
+
+    def _clear_markers(self):
+        self._safe_remove_artist(self.marker_artist)
+        self._safe_remove_artist(self.symmetric_marker)
+        self.marker_artist = None
+        self.symmetric_marker = None
+
     def _display_image(self, axis, image, title):
+        if axis is self.ax_spectrum:
+            self._clear_markers()
         height, width = image.shape[:2]
         axis.clear()
         axis.imshow(
@@ -560,9 +578,44 @@ class FilterPortalApp:
         )
         if not path:
             return
+
+        new_file = path != self.mhd_path
+        self._clear_markers()
         self.mhd_path = path
         self._axis_zoom = {}
-        self.reload_slice(reset_zoom=True)
+        self._base_limits = {}
+
+        if new_file:
+            self.slice_var.set("0")
+            self.slice_shape = None
+            self.volume_shape = None
+            self._create_default_filter()
+
+        self.reload_slice(reset_zoom=True, new_volume=new_file)
+
+    def close_mhd(self):
+        self._clear_markers()
+        self.mhd_path = None
+        self.slice_image = None
+        self.slice_shape = None
+        self.volume_shape = None
+        self.fshift_base = None
+        self.log_spectrum = None
+        self._axis_zoom = {}
+        self._base_limits = {}
+
+        for axis, title in (
+            (self.ax_original, "Original Slice"),
+            (self.ax_spectrum, "Frequency Spectrum"),
+            (self.ax_filtered, "Filtered Slice"),
+        ):
+            axis.clear()
+            axis.set_title(title)
+            axis.set_xticks([])
+            axis.set_yticks([])
+
+        self.status_var.set("MHD file closed. Click Load MHD to open another file.")
+        self.canvas.draw_idle()
 
     def _current_axis(self):
         return int(self.axis_var.get())
@@ -571,7 +624,7 @@ class FilterPortalApp:
         if self.mhd_path:
             self.reload_slice(reset_zoom=True)
 
-    def reload_slice(self, reset_zoom=False):
+    def reload_slice(self, reset_zoom=False, new_volume=False):
         if not self.mhd_path:
             messagebox.showinfo("Load MHD", "Please load an MHD file first.")
             return
@@ -580,7 +633,7 @@ class FilterPortalApp:
                 self._axis_zoom = {}
             slice_index = int(self.slice_var.get())
             axis = self._current_axis()
-            previous_shape = self.slice_shape
+            previous_shape = None if new_volume else self.slice_shape
             self.slice_image, _, info = load_mhd_slice(
                 self.mhd_path,
                 slice_index=slice_index,
@@ -645,14 +698,10 @@ class FilterPortalApp:
 
     def update_markers(self):
         if self.log_spectrum is None:
+            self._clear_markers()
             return
 
-        if self.marker_artist is not None:
-            self.marker_artist.remove()
-            self.marker_artist = None
-        if self.symmetric_marker is not None:
-            self.symmetric_marker.remove()
-            self.symmetric_marker = None
+        self._clear_markers()
 
         spec = self.selected_filter()
         if spec is None:
