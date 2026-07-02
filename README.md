@@ -20,6 +20,8 @@ Three varients of the Notch Filters are implemented:
 - Click or drag on the frequency spectrum to position each filter point
 - Preview filtered result side-by-side with original image and spectrum
 - Save filtered slice as PNG
+- Display keeps the original slice aspect ratio (non-square images are not stretched)
+- Frequency spectrum and filtered output always keep the same width x height as the input slice
 
 ```bash
 pip install -r requirements.txt

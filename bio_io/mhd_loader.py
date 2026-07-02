@@ -17,7 +17,12 @@ def load_mhd_slice(path, slice_index=None, axis=0):
     volume = sitk.GetArrayFromImage(image).astype(np.float64)
 
     if volume.ndim == 2:
-        return volume, image, {"is_volume": False, "slice_index": 0, "shape": volume.shape}
+        return volume, image, {
+            "is_volume": False,
+            "slice_index": 0,
+            "shape": volume.shape,
+            "slice_shape": volume.shape,
+        }
 
     if slice_index is None:
         slice_index = volume.shape[axis] // 2
@@ -37,6 +42,7 @@ def load_mhd_slice(path, slice_index=None, axis=0):
         "is_volume": True,
         "slice_index": slice_index,
         "shape": volume.shape,
+        "slice_shape": slice_data.shape,
         "axis": axis,
     }
 

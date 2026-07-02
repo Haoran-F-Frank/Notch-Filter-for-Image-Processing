@@ -38,11 +38,21 @@ class NotchFilterSpec:
 
 def compute_fshift(image_2d):
     image = np.asarray(image_2d, dtype=np.float64)
-    return np.fft.fftshift(np.fft.fft2(image))
+    if image.ndim != 2:
+        raise ValueError(f"Expected 2D slice, got shape {image.shape}")
+    fshift = np.fft.fftshift(np.fft.fft2(image))
+    if fshift.shape != image.shape:
+        raise ValueError(
+            f"Frequency domain shape {fshift.shape} does not match image shape {image.shape}"
+        )
+    return fshift
 
 
 def compute_log_magnitude(fshift):
-    return 20 * np.log(np.abs(fshift) + 1e-8)
+    spectrum = 20 * np.log(np.abs(fshift) + 1e-8)
+    if spectrum.shape != fshift.shape:
+        raise ValueError("Spectrum shape must match frequency-domain input shape")
+    return spectrum
 
 
 def build_notch_mask(height, width, point_x, point_y, radius, filter_type, order=1):
@@ -62,6 +72,10 @@ def build_notch_mask(height, width, point_x, point_y, radius, filter_type, order
 
 
 def apply_filter_specs(fshift_base, filter_specs):
+    fshift_base = np.asarray(fshift_base)
+    if fshift_base.ndim != 2:
+        raise ValueError(f"Expected 2D frequency data, got shape {fshift_base.shape}")
+
     fshift = np.array(fshift_base, copy=True)
     height, width = fshift.shape
 
@@ -77,7 +91,13 @@ def apply_filter_specs(fshift_base, filter_specs):
             spec.filter_type,
             order=spec.order,
         )
+        if mask.shape != (height, width):
+            raise ValueError("Notch mask shape must match the input slice shape")
         fshift *= mask
 
     reconstructed = np.abs(np.fft.ifft2(np.fft.ifftshift(fshift)))
+    if reconstructed.shape != fshift_base.shape:
+        raise ValueError(
+            f"Filtered image shape {reconstructed.shape} does not match input shape {fshift_base.shape}"
+        )
     return reconstructed, fshift

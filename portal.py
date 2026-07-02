@@ -35,6 +35,7 @@ class FilterPortalApp:
 
         self.mhd_path = None
         self.slice_image = None
+        self.slice_shape = None
         self.fshift_base = None
         self.log_spectrum = None
         self.filters = []
@@ -137,23 +138,21 @@ class FilterPortalApp:
         widget.pack(side=tk.LEFT, fill=tk.X, expand=True)
 
     def _build_plot_panel(self, parent):
-        self.fig, self.axes = plt.subplots(1, 3, figsize=(12, 4))
-        self.fig.tight_layout(pad=2.0)
+        self.plot_parent = parent
+        self.fig, self.axes = plt.subplots(
+            1,
+            3,
+            figsize=(12, 4),
+            constrained_layout=True,
+        )
 
         self.ax_original = self.axes[0]
         self.ax_spectrum = self.axes[1]
         self.ax_filtered = self.axes[2]
 
-        self.ax_original.set_title("Original Slice")
-        self.ax_spectrum.set_title("Frequency Spectrum (click/drag point)")
-        self.ax_filtered.set_title("Filtered Slice")
-
-        for axis in self.axes:
-            axis.set_xticks([])
-            axis.set_yticks([])
-
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+        self.plot_parent.bind("<Configure>", self._on_plot_resize)
 
         self.marker_artist = None
         self.symmetric_marker = None
@@ -161,6 +160,72 @@ class FilterPortalApp:
         self.canvas.mpl_connect("button_press_event", self.on_canvas_press)
         self.canvas.mpl_connect("motion_notify_event", self.on_canvas_motion)
         self.canvas.mpl_connect("button_release_event", self.on_canvas_release)
+
+    def _display_image(self, axis, image, title):
+        height, width = image.shape[:2]
+        axis.clear()
+        axis.imshow(
+            image,
+            cmap="gray",
+            aspect="equal",
+            interpolation="nearest",
+            origin="upper",
+        )
+        axis.set_xlim(-0.5, width - 0.5)
+        axis.set_ylim(height - 0.5, -0.5)
+        axis.set_aspect("equal", adjustable="box")
+        axis.set_title(f"{title} ({width} x {height})")
+        axis.set_xticks([])
+        axis.set_yticks([])
+
+    def _resize_figure_for_image(self, height, width):
+        pixels_per_inch = self.fig.dpi
+        panel_width_px = max(self.plot_parent.winfo_width() - 24, 480) / 3
+        panel_height_px = max(self.plot_parent.winfo_height() - 24, 240)
+
+        image_aspect = height / width
+        panel_aspect = panel_height_px / panel_width_px
+
+        if image_aspect > panel_aspect:
+            display_height = panel_height_px
+            display_width = panel_height_px / image_aspect
+        else:
+            display_width = panel_width_px
+            display_height = panel_width_px * image_aspect
+
+        fig_width = max(display_width * 3 / pixels_per_inch, 9.0)
+        fig_height = max(display_height / pixels_per_inch, 3.0)
+        self.fig.set_size_inches(fig_width, fig_height, forward=True)
+
+    def _on_plot_resize(self, _event=None):
+        if self.slice_shape is None:
+            return
+        height, width = self.slice_shape
+        self._resize_figure_for_image(height, width)
+        self.canvas.draw_idle()
+
+    def _adapt_filters_to_shape(self, height, width, previous_shape=None):
+        center_x = width / 2
+        center_y = height / 2
+
+        if previous_shape is None:
+            for index, spec in enumerate(self.filters):
+                spec.x = center_x
+                spec.y = center_y
+                spec.name = spec.name or f"Filter {index + 1}"
+            return
+
+        old_height, old_width = previous_shape
+        if (old_height, old_width) == (height, width):
+            return
+
+        scale_x = width / old_width
+        scale_y = height / old_height
+        scale_radius = (scale_x + scale_y) / 2
+        for spec in self.filters:
+            spec.x *= scale_x
+            spec.y *= scale_y
+            spec.radius *= scale_radius
 
     def _create_default_filter(self):
         self.filters = [
@@ -308,39 +373,58 @@ class FilterPortalApp:
             return
         try:
             slice_index = int(self.slice_var.get())
+            previous_shape = self.slice_shape
             self.slice_image, _, info = load_mhd_slice(self.mhd_path, slice_index=slice_index)
+            self.slice_shape = self.slice_image.shape
+            height, width = self.slice_shape
+
             self.fshift_base = compute_fshift(self.slice_image)
             self.log_spectrum = compute_log_magnitude(self.fshift_base)
+
+            if self.log_spectrum.shape != self.slice_shape:
+                raise ValueError(
+                    f"Spectrum shape {self.log_spectrum.shape} does not match slice shape {self.slice_shape}"
+                )
+
+            self._adapt_filters_to_shape(height, width, previous_shape=previous_shape)
+            self._resize_figure_for_image(height, width)
             self.status_var.set(
-                f"Loaded {pathlib.Path(self.mhd_path).name} | shape={info['shape']} | slice={slice_index}"
+                f"Loaded {pathlib.Path(self.mhd_path).name} | volume={info['shape']} | "
+                f"slice={slice_index} | slice_size={width}x{height} | spectrum={width}x{height}"
             )
             self._draw_original()
             self._draw_spectrum()
+            self.load_params_to_form()
+            self.refresh_filter_list()
             self.update_markers()
             self.preview()
         except Exception as error:
             messagebox.showerror("Failed to load slice", str(error))
 
     def _draw_original(self):
-        self.ax_original.clear()
-        self.ax_original.imshow(normalize_to_uint8(self.slice_image), cmap="gray")
-        self.ax_original.set_title("Original Slice")
-        self.ax_original.set_xticks([])
-        self.ax_original.set_yticks([])
+        self._display_image(
+            self.ax_original,
+            normalize_to_uint8(self.slice_image),
+            "Original Slice",
+        )
 
     def _draw_spectrum(self):
-        self.ax_spectrum.clear()
-        self.ax_spectrum.imshow(self.log_spectrum, cmap="gray")
-        self.ax_spectrum.set_title("Frequency Spectrum (click/drag point)")
-        self.ax_spectrum.set_xticks([])
-        self.ax_spectrum.set_yticks([])
+        self._display_image(
+            self.ax_spectrum,
+            self.log_spectrum,
+            "Frequency Spectrum (click/drag point)",
+        )
 
     def _draw_filtered(self, filtered_image):
-        self.ax_filtered.clear()
-        self.ax_filtered.imshow(normalize_to_uint8(filtered_image), cmap="gray")
-        self.ax_filtered.set_title("Filtered Slice")
-        self.ax_filtered.set_xticks([])
-        self.ax_filtered.set_yticks([])
+        if filtered_image.shape != self.slice_shape:
+            raise ValueError(
+                f"Filtered slice shape {filtered_image.shape} does not match original slice shape {self.slice_shape}"
+            )
+        self._display_image(
+            self.ax_filtered,
+            normalize_to_uint8(filtered_image),
+            "Filtered Slice",
+        )
 
     def update_markers(self):
         if self.log_spectrum is None:
@@ -389,6 +473,10 @@ class FilterPortalApp:
         try:
             self.apply_parameters_silent()
             filtered, _ = apply_filter_specs(self.fshift_base, self.filters)
+            if filtered.shape != self.slice_shape:
+                raise ValueError(
+                    f"Filtered shape {filtered.shape} does not match slice shape {self.slice_shape}"
+                )
             self._draw_filtered(filtered)
             self.update_markers()
             self.canvas.draw_idle()
@@ -459,6 +547,10 @@ class FilterPortalApp:
         if not path:
             return
         filtered, _ = apply_filter_specs(self.fshift_base, self.filters)
+        if filtered.shape != self.slice_shape:
+            raise ValueError(
+                f"Filtered shape {filtered.shape} does not match slice shape {self.slice_shape}"
+            )
         save_slice_png(filtered, path)
         messagebox.showinfo("Saved", f"Filtered image saved to:\n{path}")
 
