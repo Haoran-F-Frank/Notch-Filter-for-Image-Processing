@@ -10,7 +10,14 @@ import numpy as np
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from PIL import Image
 
-from bio_io.mhd_loader import AXIS_LABELS, load_mhd_slice, save_slice_png, window_to_uint8
+from bio_io.mhd_loader import (
+    AXIS_LABELS,
+    load_mhd_slice,
+    load_mhd_volume,
+    paired_window_to_uint8,
+    save_mhd_volume,
+    save_slice_png,
+)
 from filters.notch_core import (
     FILTER_TYPE_BUTTERWORTH,
     FILTER_TYPE_GAUSSIAN,
@@ -19,6 +26,7 @@ from filters.notch_core import (
     compute_fshift,
     compute_log_magnitude,
 )
+from filters.volume_filter import apply_filters_to_volume
 
 
 class FilterPortalApp:
@@ -35,6 +43,7 @@ class FilterPortalApp:
         self.root.geometry("1400x900")
 
         self.mhd_path = None
+        self.reference_image = None
         self.slice_image = None
         self.slice_shape = None
         self.fshift_base = None
@@ -45,7 +54,10 @@ class FilterPortalApp:
         self.volume_shape = None
         self._base_limits = {}
         self._axis_zoom = {}
+        self._zoom_centers = {}
+        self._display_window = None
         self._ctrl_pressed = False
+        self._shift_pressed = False
         self._reload_after_id = None
         self._updating_controls = False
         self._axis_trace_ready = False
@@ -56,6 +68,12 @@ class FilterPortalApp:
         self.intensity_min_var = tk.StringVar(value=str(intensity_min))
         self.intensity_max_var = tk.StringVar(value=str(intensity_max))
         self.auto_intensity_var = tk.BooleanVar(value=auto_intensity)
+        self.link_time_zoom_var = tk.BooleanVar(value=True)
+        self.live_preview_var = tk.BooleanVar(value=True)
+        self.panel_width_original = tk.DoubleVar(value=1.0)
+        self.panel_width_spectrum = tk.DoubleVar(value=1.0)
+        self.panel_width_filtered = tk.DoubleVar(value=1.3)
+        self._preview_after_id = None
 
         self._build_layout()
         self._axis_trace_ready = True
@@ -92,6 +110,7 @@ class FilterPortalApp:
         tk.Button(toolbar, text="Load Slice", command=lambda: self.reload_slice()).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Preview", command=self.preview).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Save Filtered PNG", command=self.save_filtered).pack(side=tk.LEFT, padx=4)
+        tk.Button(toolbar, text="Save Filtered MHD", command=self.save_filtered_mhd).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Reset Zoom", command=self.reset_zoom).pack(side=tk.LEFT, padx=4)
         tk.Button(toolbar, text="Zoom +", command=lambda: self.zoom_by_button(True)).pack(side=tk.LEFT, padx=2)
         tk.Button(toolbar, text="Zoom -", command=lambda: self.zoom_by_button(False)).pack(side=tk.LEFT, padx=2)
@@ -142,6 +161,56 @@ class FilterPortalApp:
         ).pack(side=tk.LEFT, padx=4)
         self.data_range_label = tk.Label(intensity_bar, text="Data range: N/A")
         self.data_range_label.pack(side=tk.LEFT, padx=12)
+
+        layout_bar = tk.Frame(self.root)
+        layout_bar.pack(side=tk.TOP, fill=tk.X, padx=8, pady=(0, 6))
+        tk.Label(layout_bar, text="Panel width  Original").pack(side=tk.LEFT)
+        tk.Scale(
+            layout_bar,
+            from_=0.5,
+            to=3.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            variable=self.panel_width_original,
+            length=120,
+            command=lambda _value: self._apply_panel_layout(),
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(layout_bar, text="Spectrum").pack(side=tk.LEFT)
+        tk.Scale(
+            layout_bar,
+            from_=0.5,
+            to=3.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            variable=self.panel_width_spectrum,
+            length=120,
+            command=lambda _value: self._apply_panel_layout(),
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(layout_bar, text="Filtered").pack(side=tk.LEFT)
+        tk.Scale(
+            layout_bar,
+            from_=0.5,
+            to=3.0,
+            resolution=0.1,
+            orient=tk.HORIZONTAL,
+            variable=self.panel_width_filtered,
+            length=120,
+            command=lambda _value: self._apply_panel_layout(),
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Checkbutton(
+            layout_bar,
+            text="Link original/filtered zoom",
+            variable=self.link_time_zoom_var,
+        ).pack(side=tk.LEFT, padx=8)
+        tk.Checkbutton(
+            layout_bar,
+            text="Live preview",
+            variable=self.live_preview_var,
+        ).pack(side=tk.LEFT, padx=4)
+        tk.Label(
+            layout_bar,
+            text="Click original/filtered to zoom in at point | Shift+click zoom out",
+        ).pack(side=tk.LEFT, padx=8)
 
         body = tk.PanedWindow(self.root, orient=tk.HORIZONTAL)
         body.pack(fill=tk.BOTH, expand=True)
@@ -202,7 +271,13 @@ class FilterPortalApp:
         self._add_param_row(params, "Y", tk.Entry(params, textvariable=self.y_var, width=20))
         self._add_param_row(params, "Radius", tk.Entry(params, textvariable=self.radius_var, width=20))
         self._add_param_row(params, "Order (Butterworth)", tk.Entry(params, textvariable=self.order_var, width=20))
-        tk.Checkbutton(params, text="Enabled", variable=self.enabled_var).pack(anchor="w", padx=8, pady=4)
+        tk.Checkbutton(params, text="Enabled", variable=self.enabled_var, command=self._schedule_live_preview).pack(
+            anchor="w", padx=8, pady=4
+        )
+
+        for var in (self.radius_var, self.order_var, self.x_var, self.y_var):
+            var.trace_add("write", lambda *_args: self._schedule_live_preview())
+        self.type_var.trace_add("write", lambda *_args: self._schedule_live_preview())
 
         tk.Button(params, text="Apply Parameters", command=self.apply_parameters).pack(fill=tk.X, padx=8, pady=6)
 
@@ -212,11 +287,12 @@ class FilterPortalApp:
             "2. Change Slice via entry, slider, ◀▶ buttons, or mouse wheel.\n"
             "3. Ctrl + mouse wheel (or Zoom +/-) to enlarge the image for tiny noise details.\n"
             "4. Set Zoom target to 'filtered' to zoom the right panel only.\n"
-            "5. Use 'Large Filtered View' for a bigger popup window.\n"
-            "7. Adjust Intensity Min/Max (e.g. -500 to 1000) for noisy CT-like display.\n"
-            "8. Click on the spectrum to move the selected filter point.\n"
-            "9. Type 0 = Butterworth, 1 = Gaussian.\n"
-            "10. Press Preview to update filtered image."
+            "5. Original and filtered use the same intensity scaling for display.\n"
+            "6. Save Filtered MHD keeps raw intensity values (float, not windowed).\n"
+            "7. Click original/filtered to zoom in at cursor; Shift+click zooms out.\n"
+            "8. Adjust panel width sliders to resize original/spectrum/filtered views.\n"
+            "9. Click on the spectrum to move the selected filter point.\n"
+            "10. Enable Live preview to update filtered image while editing filters."
         )
         tk.Label(parent, text=help_text, justify=tk.LEFT, wraplength=300).pack(anchor="w", padx=8, pady=8)
 
@@ -228,16 +304,8 @@ class FilterPortalApp:
 
     def _build_plot_panel(self, parent):
         self.plot_parent = parent
-        self.fig, self.axes = plt.subplots(
-            1,
-            3,
-            figsize=(12, 4),
-            constrained_layout=True,
-        )
-
-        self.ax_original = self.axes[0]
-        self.ax_spectrum = self.axes[1]
-        self.ax_filtered = self.axes[2]
+        self.fig = plt.figure(figsize=(12, 4), constrained_layout=True)
+        self._create_axes()
 
         self.canvas = FigureCanvasTkAgg(self.fig, master=parent)
         self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
@@ -264,6 +332,50 @@ class FilterPortalApp:
         self.root.bind("<Control_R>", self._on_ctrl_press, add="+")
         self.root.bind("<KeyRelease-Control_L>", self._on_ctrl_release, add="+")
         self.root.bind("<KeyRelease-Control_R>", self._on_ctrl_release, add="+")
+        self.root.bind("<Shift_L>", self._on_shift_press, add="+")
+        self.root.bind("<Shift_R>", self._on_shift_press, add="+")
+        self.root.bind("<KeyRelease-Shift_L>", self._on_shift_release, add="+")
+        self.root.bind("<KeyRelease-Shift_R>", self._on_shift_release, add="+")
+
+    def _create_axes(self):
+        self.fig.clf()
+        ratios = [
+            max(self.panel_width_original.get(), 0.1),
+            max(self.panel_width_spectrum.get(), 0.1),
+            max(self.panel_width_filtered.get(), 0.1),
+        ]
+        grid = self.fig.add_gridspec(1, 3, width_ratios=ratios)
+        self.ax_original = self.fig.add_subplot(grid[0, 0])
+        self.ax_spectrum = self.fig.add_subplot(grid[0, 1])
+        self.ax_filtered = self.fig.add_subplot(grid[0, 2])
+        self.axes = (self.ax_original, self.ax_spectrum, self.ax_filtered)
+
+    def _apply_panel_layout(self):
+        zoom_backup = dict(self._axis_zoom)
+        centers_backup = dict(self._zoom_centers)
+        limits_backup = dict(self._base_limits)
+        self._create_axes()
+        self._base_limits = limits_backup
+        self._axis_zoom = zoom_backup
+        self._zoom_centers = centers_backup
+        if self.slice_image is not None:
+            self._redraw_all_views()
+        self.canvas.draw_idle()
+
+    def _on_shift_press(self, _event=None):
+        self._shift_pressed = True
+
+    def _on_shift_release(self, _event=None):
+        self._shift_pressed = False
+
+    def _shift_is_pressed(self, event=None):
+        if getattr(self, "_shift_pressed", False):
+            return True
+        if event is not None:
+            state = getattr(event, "state", 0)
+            if state & 0x0001:
+                return True
+        return False
 
     def on_axes_enter(self, event):
         if event.inaxes in (self.ax_original, self.ax_spectrum, self.ax_filtered):
@@ -361,8 +473,45 @@ class FilterPortalApp:
             raise ValueError("Intensity Max must be greater than Min.")
         return window_min, window_max
 
-    def _to_display_uint8(self, array):
+    def _compute_display_window(self, filtered_image=None):
+        if self.slice_image is None:
+            return None, None
         window_min, window_max = self._get_intensity_window()
+        if window_min is not None and window_max is not None:
+            self._display_window = (window_min, window_max)
+            return self._display_window
+
+        arrays = [self.slice_image]
+        if filtered_image is not None:
+            arrays.append(filtered_image)
+        combined = np.concatenate([array.ravel() for array in arrays])
+        window_min = float(combined.min())
+        window_max = float(combined.max())
+        if window_max <= window_min:
+            window_max = window_min + 1.0
+        self._display_window = (window_min, window_max)
+        return self._display_window
+
+    def _paired_display_images(self, filtered_image=None):
+        if filtered_image is None:
+            filtered_image = self._last_filtered if self._last_filtered is not None else self.slice_image
+        window_min, window_max = self._compute_display_window(filtered_image)
+        original_u8, filtered_u8, _, _ = paired_window_to_uint8(
+            self.slice_image,
+            filtered_image,
+            window_min,
+            window_max,
+        )
+        return original_u8, filtered_u8, window_min, window_max
+
+    def _to_display_uint8(self, array):
+        if self._display_window is not None:
+            from bio_io.mhd_loader import window_to_uint8
+
+            return window_to_uint8(array, self._display_window[0], self._display_window[1])
+        window_min, window_max = self._get_intensity_window()
+        from bio_io.mhd_loader import window_to_uint8
+
         return window_to_uint8(array, window_min, window_max)
 
     def _set_intensity_preset(self, window_min, window_max):
@@ -387,13 +536,8 @@ class FilterPortalApp:
         except ValueError as error:
             messagebox.showerror("Invalid intensity window", str(error))
             return
-        self._draw_original()
-        if self._last_filtered is not None:
-            self._draw_filtered(self._last_filtered)
-        self._update_intensity_status()
-        if self._large_view_window is not None and self._large_view_window.winfo_exists():
-            self._refresh_large_filtered_view()
-        self.canvas.draw_idle()
+        self._display_window = None
+        self._redraw_all_views()
 
     def _update_intensity_status(self):
         if self.slice_image is None:
@@ -496,8 +640,20 @@ class FilterPortalApp:
 
     def reset_zoom(self):
         self._axis_zoom = {}
+        self._zoom_centers = {}
         for axis in (self.ax_original, self.ax_spectrum, self.ax_filtered):
             self._restore_axis_view(axis)
+        self._update_zoom_status()
+        self.canvas.draw_idle()
+
+    def _click_zoom_time_domain(self, event, zoom_in):
+        if event.xdata is None or event.ydata is None:
+            return
+        center = (event.xdata, event.ydata)
+        axes = [self.ax_original, self.ax_filtered] if self.link_time_zoom_var.get() else [event.inaxes]
+        for axis in axes:
+            self._zoom_single_axis(axis, zoom_in, center=center)
+            self._zoom_centers[id(axis)] = center
         self._update_zoom_status()
         self.canvas.draw_idle()
 
@@ -567,6 +723,8 @@ class FilterPortalApp:
 
         axis.set_xlim(cx - new_width * relx, cx + new_width * (1 - relx))
         axis.set_ylim(cy + new_height * (1 - rely), cy - new_height * rely)
+        if center and center[0] is not None and center[1] is not None:
+            self._zoom_centers[id(axis)] = center
 
     def _safe_remove_artist(self, artist):
         if artist is None:
@@ -576,6 +734,18 @@ class FilterPortalApp:
                 artist.remove()
         except (ValueError, AttributeError, NotImplementedError):
             pass
+
+    def _schedule_live_preview(self):
+        if not self.live_preview_var.get() or self.fshift_base is None:
+            return
+        if self._preview_after_id is not None:
+            self.root.after_cancel(self._preview_after_id)
+
+        def _run():
+            self._preview_after_id = None
+            self.preview()
+
+        self._preview_after_id = self.root.after(120, _run)
 
     def _clear_markers(self):
         self._safe_remove_artist(self.marker_artist)
@@ -617,8 +787,12 @@ class FilterPortalApp:
             return
         bx0, bx1 = base_xlim
         by0, by1 = base_ylim
-        cx = (bx0 + bx1) / 2
-        cy = (by0 + by1) / 2
+        center = self._zoom_centers.get(id(axis))
+        if center:
+            cx, cy = center
+        else:
+            cx = (bx0 + bx1) / 2
+            cy = (by0 + by1) / 2
         half_w = (bx1 - bx0) / (2 * zoom)
         half_h = abs(by1 - by0) / (2 * zoom)
         axis.set_xlim(cx - half_w, cx + half_w)
@@ -720,6 +894,7 @@ class FilterPortalApp:
         spec = self.selected_filter()
         if spec is None:
             return
+        self._updating_controls = True
         self.name_var.set(spec.name)
         self.type_var.set(str(spec.filter_type))
         self.x_var.set(f"{spec.x:.2f}")
@@ -727,6 +902,7 @@ class FilterPortalApp:
         self.radius_var.set(f"{spec.radius:.2f}")
         self.order_var.set(str(spec.order))
         self.enabled_var.set(spec.enabled)
+        self._updating_controls = False
 
     def apply_parameters(self):
         spec = self.selected_filter()
@@ -821,6 +997,7 @@ class FilterPortalApp:
             self.slice_var.set("0")
             self.slice_shape = None
             self.volume_shape = None
+            self.reference_image = None
             self._create_default_filter()
 
         self.reload_slice(reset_zoom=True, new_volume=new_file)
@@ -831,6 +1008,7 @@ class FilterPortalApp:
             self._reload_after_id = None
         self._clear_markers()
         self.mhd_path = None
+        self.reference_image = None
         self.slice_image = None
         self.slice_shape = None
         self.volume_shape = None
@@ -850,10 +1028,21 @@ class FilterPortalApp:
             axis.set_yticks([])
 
         self.status_var.set("MHD file closed. Click Load MHD to open another file.")
+        self._sync_slice_controls(0)
         self.canvas.draw_idle()
 
-        self.status_var.set("MHD file closed. Click Load MHD to open another file.")
-        self._sync_slice_controls(0)
+    def _redraw_all_views(self):
+        if self.slice_image is None:
+            return
+        self._draw_original()
+        self._draw_spectrum()
+        if self._last_filtered is not None:
+            self._draw_filtered(self._last_filtered)
+        else:
+            self.preview()
+        self._update_intensity_status()
+        if self._large_view_window is not None and self._large_view_window.winfo_exists():
+            self._refresh_large_filtered_view()
         self.canvas.draw_idle()
 
     def reload_slice(self, reset_zoom=False, new_volume=False, new_orientation=False):
@@ -869,7 +1058,7 @@ class FilterPortalApp:
                 previous_shape = None
             else:
                 previous_shape = self.slice_shape
-            self.slice_image, _, info = load_mhd_slice(
+            self.slice_image, self.reference_image, info = load_mhd_slice(
                 self.mhd_path,
                 slice_index=slice_index,
                 axis=axis,
@@ -909,17 +1098,16 @@ class FilterPortalApp:
     def _draw_original(self):
         axis = self._current_axis()
         axis_label = AXIS_LABELS.get(axis, str(axis))
+        filtered = self._last_filtered if self._last_filtered is not None else self.slice_image
+        original_u8, _, window_min, window_max = paired_window_to_uint8(
+            self.slice_image,
+            filtered,
+            *self._compute_display_window(filtered if self._last_filtered is not None else None),
+        )
         self._display_image(
             self.ax_original,
-            self._to_display_uint8(self.slice_image),
+            original_u8,
             f"Original Slice [{axis_label}]",
-        )
-
-    def _draw_spectrum(self):
-        self._display_image(
-            self.ax_spectrum,
-            self.log_spectrum,
-            "Frequency Spectrum (click/drag point)",
         )
 
     def _draw_filtered(self, filtered_image):
@@ -927,10 +1115,23 @@ class FilterPortalApp:
             raise ValueError(
                 f"Filtered slice shape {filtered_image.shape} does not match original slice shape {self.slice_shape}"
             )
+        _, filtered_u8, window_min, window_max = paired_window_to_uint8(
+            self.slice_image,
+            filtered_image,
+            *self._compute_display_window(filtered_image),
+        )
+        title = f"Filtered Slice [{window_min:.0f}..{window_max:.0f}]"
         self._display_image(
             self.ax_filtered,
-            self._to_display_uint8(filtered_image),
-            "Filtered Slice",
+            filtered_u8,
+            title,
+        )
+
+    def _draw_spectrum(self):
+        self._display_image(
+            self.ax_spectrum,
+            self.log_spectrum,
+            "Frequency Spectrum (click/drag point)",
         )
 
     def update_markers(self):
@@ -1099,6 +1300,10 @@ class FilterPortalApp:
             return
 
     def on_canvas_press(self, event):
+        if event.inaxes in (self.ax_original, self.ax_filtered):
+            zoom_in = not self._shift_is_pressed(event)
+            self._click_zoom_time_domain(event, zoom_in=zoom_in)
+            return
         if event.inaxes != self.ax_spectrum or self.selected_filter() is None:
             return
         if event.xdata is None or event.ydata is None:
@@ -1130,7 +1335,45 @@ class FilterPortalApp:
         self.y_var.set(f"{spec.y:.2f}")
         self.update_markers()
         if preview:
-            self.preview()
+            if self.live_preview_var.get():
+                self._schedule_live_preview()
+            else:
+                self.preview()
+
+    def save_filtered_mhd(self):
+        if self.fshift_base is None or self.reference_image is None or not self.mhd_path:
+            messagebox.showinfo("Save MHD", "Load an MHD volume and preview first.")
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save filtered MHD volume",
+            defaultextension=".mhd",
+            filetypes=[("MetaImage", "*.mhd"), ("MetaImage compressed", "*.mha")],
+        )
+        if not path:
+            return
+        try:
+            self.apply_parameters_silent()
+            volume, reference_image = load_mhd_volume(self.mhd_path)
+            axis = self._current_axis()
+            total = volume.shape[axis]
+
+            def progress(done, count):
+                self.status_var.set(f"Filtering volume for MHD save: {done}/{count}")
+                self.root.update_idletasks()
+
+            filtered_volume = apply_filters_to_volume(
+                volume,
+                self.filters,
+                axis=axis,
+                progress_callback=progress,
+            )
+            save_mhd_volume(filtered_volume, reference_image, path)
+            messagebox.showinfo(
+                "Saved",
+                f"Filtered MHD saved to:\n{path}\n\nRaw intensity values preserved (float32).",
+            )
+        except Exception as error:
+            messagebox.showerror("Save MHD failed", str(error))
 
     def save_filtered(self):
         if self.fshift_base is None:

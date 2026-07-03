@@ -22,7 +22,10 @@ Three varients of the Notch Filters are implemented:
 - Mouse wheel scrolls through slices; Ctrl + mouse wheel zooms the image view
 - Adjust display intensity window (default -500 to 1000) without changing FFT/filter data
 - Preview filtered result side-by-side with original image and spectrum
-- Save filtered slice as PNG
+- Save filtered slice as PNG or full filtered volume as MHD (raw intensity preserved)
+- Original and filtered time-domain images always share the same display intensity window
+- Resize original/spectrum/filtered panels with width sliders
+- Click original/filtered to zoom in at cursor; Shift+click zooms out
 - Display keeps the original slice aspect ratio (non-square images are not stretched)
 - Frequency spectrum and filtered output always keep the same width x height as the input slice
 

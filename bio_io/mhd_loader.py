@@ -12,16 +12,31 @@ AXIS_LABELS = {
 }
 
 
-def load_mhd_slice(path, slice_index=None, axis=0):
+def _resolve_mhd_path(path):
     path = pathlib.Path(path)
     if path.suffix.lower() == ".raw":
         mhd_files = sorted(path.parent.glob("*.mhd"))
         if not mhd_files:
             raise ValueError(f"No .mhd header found for raw file: {path}")
         path = mhd_files[0]
+    return path
 
+
+def load_mhd_volume(path):
+    path = _resolve_mhd_path(path)
     image = sitk.ReadImage(str(path))
     volume = sitk.GetArrayFromImage(image).astype(np.float64)
+    return volume, image
+
+
+def save_mhd_volume(volume, reference_image, path):
+    output = sitk.GetImageFromArray(np.asarray(volume, dtype=np.float32))
+    output.CopyInformation(reference_image)
+    sitk.WriteImage(output, str(path))
+
+
+def load_mhd_slice(path, slice_index=None, axis=0):
+    volume, image = load_mhd_volume(path)
 
     if volume.ndim == 2:
         return volume, image, {
@@ -73,6 +88,21 @@ def window_to_uint8(array, window_min=None, window_max=None):
     clipped = np.clip(array, window_min, window_max)
     scaled = (clipped - window_min) / (window_max - window_min) * 255.0
     return scaled.astype(np.uint8)
+
+
+def paired_window_to_uint8(original, filtered, window_min=None, window_max=None):
+    if window_min is None or window_max is None:
+        combined = np.concatenate([original.ravel(), filtered.ravel()])
+        window_min = float(combined.min())
+        window_max = float(combined.max())
+        if window_max <= window_min:
+            window_max = window_min + 1.0
+    return (
+        window_to_uint8(original, window_min, window_max),
+        window_to_uint8(filtered, window_min, window_max),
+        window_min,
+        window_max,
+    )
 
 
 def save_slice_png(array, path, window_min=None, window_max=None):
