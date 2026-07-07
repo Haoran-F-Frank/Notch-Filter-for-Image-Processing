@@ -19,31 +19,11 @@ from ema_pytorch import EMA
 from skimage.transform import resize
 from tqdm import tqdm
 
-from data import transforms
+from intensity import HU_ADD, HU_RANGE, hu_to_model_norm, model_norm_to_hu
 from src.DADiff import ResidualDiffusion, UnetRes, set_seed
 
-HU_OFFSET = 1024
-HU_MIN = -1000
-HU_MAX = 2000
-HU_RANGE = HU_MAX - HU_MIN  # 3000
-
-
-def hu_to_model_norm(hu_slice):
-    """Match data/transforms.Normalize: shift by -1024, then linear map to [0,1]."""
-    shifted = hu_slice.astype(np.float32) - HU_OFFSET
-    return np.clip((shifted - HU_MIN) / HU_RANGE, 0.0, 1.0)
-
-
-def model_norm_to_hu(norm_slice):
-    """Exact inverse of hu_to_model_norm / transforms.Normalize."""
-    shifted = norm_slice.astype(np.float32) * HU_RANGE + HU_MIN
-    return shifted + HU_OFFSET
-
-
-VAL_TRANSFORM = transforms.Compose([
-    transforms.Normalize(min_value=HU_MIN, max_value=HU_MAX),
-    transforms.ToTensor(expand_dims=False),
-])
+# Re-export for backward compatibility
+__all__ = ['HU_ADD', 'HU_RANGE', 'hu_to_model_norm', 'model_norm_to_hu']
 
 
 def slice_stats(arr):
@@ -135,8 +115,8 @@ def maybe_resize(hu_slice, size=512):
 
 def preprocess_slice(hu_slice, size=512):
     resized = maybe_resize(hu_slice, size=size)
-    arr = np.expand_dims(resized, axis=0)
-    tensor = VAL_TRANSFORM(arr)
+    norm = hu_to_model_norm(resized)
+    tensor = torch.from_numpy(norm.astype(np.float32))
     if tensor.ndim == 2:
         tensor = tensor.unsqueeze(0)
     return tensor

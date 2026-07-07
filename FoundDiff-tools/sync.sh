@@ -10,6 +10,7 @@ echo "Tools dir:      $TOOLS"
 
 cp "$TOOLS/demo_denoise.py" "$ROOT/"
 cp "$TOOLS/denoise_nii.py" "$ROOT/"
+cp "$TOOLS/intensity.py" "$ROOT/"
 cp "$TOOLS/convert_nii_to_npy.py" "$ROOT/"
 
 # Patch src/DADiff.py for DA-CLIP.pth fallback
@@ -39,4 +40,4 @@ PY
 fi
 
 echo "Done. New files:"
-ls -la "$ROOT/demo_denoise.py" "$ROOT/denoise_nii.py" "$ROOT/convert_nii_to_npy.py"
+ls -la "$ROOT/demo_denoise.py" "$ROOT/denoise_nii.py" "$ROOT/intensity.py" "$ROOT/convert_nii_to_npy.py"

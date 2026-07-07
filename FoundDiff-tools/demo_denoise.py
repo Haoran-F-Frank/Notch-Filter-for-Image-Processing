@@ -9,7 +9,7 @@ import numpy as np
 import torch
 from ema_pytorch import EMA
 
-from data import transforms
+from intensity import HU_ADD, HU_RANGE, hu_to_model_norm, model_norm_to_hu, preprocess_hu_slice
 from src.DADiff import ResidualDiffusion, UnetRes, set_seed
 
 
@@ -52,19 +52,13 @@ def build_model(checkpoint_path, device):
 
 
 def load_npy_slice(npy_path):
-    """Load and preprocess a CT slice using the same transforms as validation."""
+    """Load and preprocess a CT slice."""
     arr = np.load(npy_path).astype(np.float32)
     if arr.ndim == 2:
-        arr = np.expand_dims(arr, axis=0)
-
-    val_transform = transforms.Compose([
-        transforms.Normalize(min_value=-1000, max_value=2000),
-        transforms.ToTensor(expand_dims=False),
-    ])
-    tensor = val_transform(arr)
-    if tensor.ndim == 2:
-        tensor = tensor.unsqueeze(0)
-    return tensor.unsqueeze(0)
+        return preprocess_hu_slice(arr)
+    if arr.ndim == 3 and arr.shape[0] == 1:
+        return preprocess_hu_slice(arr[0])
+    raise ValueError(f'Expected 2D or (1,H,W) array, got shape {arr.shape}')
 
 
 @torch.no_grad()
@@ -75,8 +69,7 @@ def denoise_one(diffusion, x, device):
 
 
 def save_comparison(input_hu, denoised_norm, out_png):
-  # Exact inverse of transforms.Normalize (NOT norm*3000-1000 which is off by 1024 HU)
-    denoised_hu = denoised_norm * 3000.0 + 24.0
+    denoised_hu = model_norm_to_hu(denoised_norm)
     vmin, vmax = -160, 240
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))
