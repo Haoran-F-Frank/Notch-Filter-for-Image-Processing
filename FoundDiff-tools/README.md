@@ -74,4 +74,23 @@ python denoise_nii.py \
 - 正确：`hu = norm * 3000 + 24`
 - 错误：`hu = norm * 3000 - 1000`（与原始 HU 相差 1024，叠成 3D 会在层边界错位）
 
+## 强度范围线性匹配（默认开启）
+
+每层记录原始 min/max/range，去噪后再线性映射回原始强度域：
+
+```
+matched = scale * denoised_raw + offset
+scale   = (in_max - in_min) / (out_raw_max - out_raw_min)
+offset  = in_min - scale * out_raw_min
+```
+
+| 参数 | 说明 |
+|------|------|
+| `--match_intensity slice` | 每层对齐到该层原始 min/max（**默认**） |
+| `--match_intensity global` | 所有层对齐到整体原始 min/max |
+| `--match_intensity none` | 不做匹配，保留模型输出 HU |
+| `--out_nii_raw` | 另存匹配前的去噪结果 |
+
+CSV 列：`in_min/max/range`, `out_raw_min/max/range`, `out_matched_min/max/range`, `match_scale`, `match_offset`, `range_ratio_raw_vs_in`
+
 **注意：** 把 `/path/to/your_input.nii.gz` 换成真实路径，那是文档占位符，不是真文件。

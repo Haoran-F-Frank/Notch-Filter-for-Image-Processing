@@ -47,11 +47,43 @@ VAL_TRANSFORM = transforms.Compose([
 
 
 def slice_stats(arr):
+    mn = float(np.min(arr))
+    mx = float(np.max(arr))
     return {
-        'min': float(np.min(arr)),
-        'max': float(np.max(arr)),
+        'min': mn,
+        'max': mx,
         'mean': float(np.mean(arr)),
+        'range': mx - mn,
     }
+
+
+def linear_match_intensity(out, target_min, target_max, eps=1e-6):
+    """
+    Linear map out domain [out_min, out_max] -> [target_min, target_max].
+    matched = scale * out + offset
+    """
+    out = out.astype(np.float32)
+    o_min = float(out.min())
+    o_max = float(out.max())
+    o_range = o_max - o_min
+    t_range = float(target_max - target_min)
+    if o_range < eps:
+        mid = (target_min + target_max) * 0.5
+        return np.full_like(out, mid, dtype=np.float32), 0.0, mid
+    scale = t_range / o_range
+    offset = target_min - o_min * scale
+    matched = out * scale + offset
+    return matched.astype(np.float32), scale, offset
+
+
+def compute_global_range(volume, axis, z_start, z_end):
+    """Min/max over all slices in [z_start, z_end)."""
+    vmin, vmax = np.inf, -np.inf
+    for z in range(z_start, z_end):
+        sl = np.take(volume, z, axis=axis)
+        vmin = min(vmin, float(sl.min()))
+        vmax = max(vmax, float(sl.max()))
+    return vmin, vmax
 
 
 def build_model(checkpoint_path, device):
@@ -185,6 +217,17 @@ def main():
         action='store_true',
         help='Save uncompressed .nii instead of .nii.gz (much faster write)',
     )
+    parser.add_argument(
+        '--match_intensity',
+        choices=['none', 'slice', 'global'],
+        default='slice',
+        help='Linearly match denoised HU range to original: per-slice (default) or global',
+    )
+    parser.add_argument(
+        '--out_nii_raw',
+        default=None,
+        help='Optional path to save denoised volume BEFORE intensity matching',
+    )
     args = parser.parse_args()
 
     if not Path(args.in_nii).exists():
@@ -211,6 +254,7 @@ def main():
     print(f'Processing slices [{z_start}, {z_end}) = {num_slices} slices')
 
     out_volume = np.zeros_like(volume_hu, dtype=np.float32)
+    raw_volume = np.zeros_like(volume_hu, dtype=np.float32) if args.out_nii_raw else None
     diffusion = build_model(args.checkpoint, device)
     if device.type == 'cuda':
         print('GPU warmup...')
@@ -220,6 +264,16 @@ def main():
     rows = []
     t0 = time.time()
     processed = 0
+
+    global_in_min, global_in_max = None, None
+    if args.match_intensity == 'global':
+        global_in_min, global_in_max = compute_global_range(
+            volume_hu, args.axis, z_start, z_end)
+        log(
+            f'Global input HU range [{z_start}:{z_end}]: '
+            f'min={global_in_min:.2f}, max={global_in_max:.2f}, '
+            f'range={global_in_max - global_in_min:.2f}'
+        )
 
     z_indices = list(range(z_start, z_end))
     pbar = tqdm(total=num_slices, desc='denoising slices', unit='slice')
@@ -236,18 +290,52 @@ def main():
         for i, z in enumerate(batch_z):
             sl_hu = batch_sl[i]
             in_stat = slice_stats(sl_hu)
-            denoised_hu = resize_back(model_norm_to_hu(denoised_norm[i]), sl_hu.shape)
+            denoised_hu_raw = resize_back(model_norm_to_hu(denoised_norm[i]), sl_hu.shape)
+            raw_stat = slice_stats(denoised_hu_raw)
+
+            if raw_volume is not None:
+                insert_slice(raw_volume, args.axis, z, denoised_hu_raw)
+
+            if args.match_intensity == 'none':
+                denoised_hu = denoised_hu_raw
+                scale, offset = 1.0, 0.0
+                target_min, target_max = raw_stat['min'], raw_stat['max']
+            elif args.match_intensity == 'slice':
+                target_min, target_max = in_stat['min'], in_stat['max']
+                denoised_hu, scale, offset = linear_match_intensity(
+                    denoised_hu_raw, target_min, target_max)
+            else:  # global
+                target_min, target_max = global_in_min, global_in_max
+                denoised_hu, scale, offset = linear_match_intensity(
+                    denoised_hu_raw, target_min, target_max)
+
             insert_slice(out_volume, args.axis, z, denoised_hu)
-            out_stat = slice_stats(denoised_hu)
+            matched_stat = slice_stats(denoised_hu)
+
+            in_range = in_stat['range']
+            raw_range = raw_stat['range']
+            range_ratio = (raw_range / in_range) if in_range > 1e-6 else float('nan')
+
             rows.append({
                 'slice': z,
                 'skipped': False,
                 'in_min': in_stat['min'],
                 'in_max': in_stat['max'],
                 'in_mean': in_stat['mean'],
-                'out_min': out_stat['min'],
-                'out_max': out_stat['max'],
-                'out_mean': out_stat['mean'],
+                'in_range': in_range,
+                'out_raw_min': raw_stat['min'],
+                'out_raw_max': raw_stat['max'],
+                'out_raw_mean': raw_stat['mean'],
+                'out_raw_range': raw_range,
+                'out_matched_min': matched_stat['min'],
+                'out_matched_max': matched_stat['max'],
+                'out_matched_mean': matched_stat['mean'],
+                'out_matched_range': matched_stat['range'],
+                'target_min': target_min,
+                'target_max': target_max,
+                'match_scale': scale,
+                'match_offset': offset,
+                'range_ratio_raw_vs_in': range_ratio,
                 'norm_min': float(denoised_norm[i].min()),
                 'norm_max': float(denoised_norm[i].max()),
                 'norm_mean': float(denoised_norm[i].mean()),
@@ -265,7 +353,8 @@ def main():
             insert_slice(out_volume, args.axis, z, sl_hu)
             rows.append({
                 'slice': z, 'skipped': True,
-                'in_min': in_stat['min'], 'in_max': in_stat['max'], 'in_mean': in_stat['mean'],
+                'in_min': in_stat['min'], 'in_max': in_stat['max'],
+                'in_mean': in_stat['mean'], 'in_range': in_stat['range'],
             })
             pbar.update(1)
             continue
@@ -320,20 +409,49 @@ def main():
     nib.save(out_img, str(out_path))
     log(f'NIfTI saved in {time.time() - t_save:.1f} s')
 
-    # Sanity check: denoised slices should be on same HU scale as input
+    if raw_volume is not None:
+        raw_path = Path(args.out_nii_raw)
+        if args.fast_save and str(raw_path).endswith('.gz'):
+            raw_path = Path(str(raw_path)[:-3])
+        log(f'Saving raw (pre-match) NIfTI -> {raw_path} ...')
+        if args.subset_only:
+            idx = [slice(None)] * raw_volume.ndim
+            idx[args.axis] = slice(z_start, z_end)
+            raw_to_save = raw_volume[tuple(idx)].copy()
+            raw_affine = affine.copy()
+        else:
+            if z_start > 0:
+                copy_volume_range(raw_volume, volume_hu, args.axis, 0, z_start)
+            if z_end < volume_hu.shape[args.axis]:
+                copy_volume_range(raw_volume, volume_hu, args.axis, z_end, volume_hu.shape[args.axis])
+            raw_to_save = raw_volume
+            raw_affine = affine
+        nib.save(
+            nib.Nifti1Image(raw_to_save.astype(np.float32), raw_affine, header=nii_in.header.copy()),
+            str(raw_path),
+        )
+        log(f'Raw NIfTI saved: {raw_path}')
+
+    # Range comparison summary
     if processed > 0:
-        for row in rows:
-            if row.get('skipped'):
-                continue
+        matched_rows = [r for r in rows if not r.get('skipped')]
+        avg_in_range = np.mean([r['in_range'] for r in matched_rows])
+        avg_raw_range = np.mean([r['out_raw_range'] for r in matched_rows])
+        avg_matched_range = np.mean([r['out_matched_range'] for r in matched_rows])
+        log(
+            f'Intensity range summary (match={args.match_intensity}): '
+            f'avg in_range={avg_in_range:.2f}, '
+            f'avg raw_out_range={avg_raw_range:.2f}, '
+            f'avg matched_range={avg_matched_range:.2f}'
+        )
+        for row in matched_rows[:1]:
             z = row['slice']
-            orig = np.take(volume_hu, z, axis=args.axis)
-            out_sl = np.take(out_volume, z, axis=args.axis)
             log(
-                f'Slice {z} HU check: input mean={orig.mean():.1f}, '
-                f'output mean={out_sl.mean():.1f}, '
-                f'delta={out_sl.mean() - orig.mean():.1f}'
+                f'Slice {z} example: in=[{row["in_min"]:.1f}, {row["in_max"]:.1f}] '
+                f'raw_out=[{row["out_raw_min"]:.1f}, {row["out_raw_max"]:.1f}] '
+                f'matched=[{row["out_matched_min"]:.1f}, {row["out_matched_max"]:.1f}] '
+                f'scale={row["match_scale"]:.6f} offset={row["match_offset"]:.2f}'
             )
-            break
 
     with open(stats_path, 'w', newline='') as f:
         if rows:
