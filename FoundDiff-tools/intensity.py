@@ -33,3 +33,14 @@ def preprocess_hu_slice(hu_slice):
     if tensor.ndim == 2:
         tensor = tensor.unsqueeze(0)
     return tensor.unsqueeze(0)
+
+
+def make_hu_nifti_header(ref_header):
+    """Reset slope/intercept so ITK-SNAP shows the same HU as numpy (no double rescale)."""
+    header = ref_header.copy()
+    header['scl_slope'] = 1.0
+    header['scl_inter'] = 0.0
+    header.set_data_dtype(np.float32)
+    header['cal_min'] = float(HU_MIN)
+    header['cal_max'] = float(HU_MAX)
+    return header

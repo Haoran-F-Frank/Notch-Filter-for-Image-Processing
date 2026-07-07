@@ -19,7 +19,9 @@ from ema_pytorch import EMA
 from skimage.transform import resize
 from tqdm import tqdm
 
-from intensity import HU_MIN, HU_MAX, HU_RANGE, hu_to_model_norm, model_norm_to_hu
+from intensity import (
+    HU_MIN, HU_MAX, HU_RANGE, hu_to_model_norm, model_norm_to_hu, make_hu_nifti_header,
+)
 from src.DADiff import ResidualDiffusion, UnetRes, set_seed
 
 
