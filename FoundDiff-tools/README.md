@@ -52,8 +52,19 @@ rm -rf /tmp/notch-tools
 ## 运行示例
 
 ```bash
+# 10 层测试（约 2-4 分钟，batch_size=1）
 python denoise_nii.py \
-  --in_nii  /path/to/input.nii.gz \
-  --out_nii data/Output/denoised.nii.gz \
+  --in_nii  data/mydata/APNHC00002_CT.nii.gz \
+  --out_nii data/Output/APNHC00002_CT_test.nii.gz \
   --z_start 100 --z_end 110
+
+# 加速：显存够用时增大 batch（RTX 可试 2 或 4）
+python denoise_nii.py \
+  --in_nii  data/mydata/APNHC00002_CT.nii.gz \
+  --out_nii data/Output/APNHC00002_CT.nii.gz \
+  --batch_size 2 --skip_air
+
+# 速度参考：~25 s/层 (batch=1)，480 层约 3 小时
 ```
+
+**注意：** 把 `/path/to/your_input.nii.gz` 换成真实路径，那是文档占位符，不是真文件。
