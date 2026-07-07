@@ -19,11 +19,8 @@ from ema_pytorch import EMA
 from skimage.transform import resize
 from tqdm import tqdm
 
-from intensity import HU_ADD, HU_RANGE, hu_to_model_norm, model_norm_to_hu
+from intensity import HU_MIN, HU_MAX, HU_RANGE, hu_to_model_norm, model_norm_to_hu
 from src.DADiff import ResidualDiffusion, UnetRes, set_seed
-
-# Re-export for backward compatibility
-__all__ = ['HU_ADD', 'HU_RANGE', 'hu_to_model_norm', 'model_norm_to_hu']
 
 
 def slice_stats(arr):
