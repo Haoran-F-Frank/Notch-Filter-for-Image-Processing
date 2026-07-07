@@ -2,12 +2,27 @@
 """Batch denoise all .nii/.nii.gz files in a folder (full volume, model loaded once)."""
 
 import argparse
+import sys
 import time
 from pathlib import Path
 
-import torch
 
-from denoise_nii import build_model, denoise_volume, log, set_seed, warmup_gpu
+def log(msg):
+    print(msg, flush=True)
+
+
+log('denoise_folder.py starting...')
+
+try:
+    import torch
+    from denoise_nii import build_model, denoise_volume, warmup_gpu
+    from src.DADiff import set_seed
+except ImportError as e:
+    log(f'IMPORT ERROR: {e}')
+    log('Activate conda env: conda activate FoundDiff2.0')
+    log('Run from repo root: ~/FoundDiff2.0/FoundDiff')
+    log('Sync scripts: bash FoundDiff-tools/sync.sh')
+    sys.exit(1)
 
 
 def find_nii_files(in_dir):
@@ -104,7 +119,7 @@ def main():
                 size=args.size,
                 batch_size=args.batch_size,
                 subset_only=False,
-                fast_save=args.fast_save and use_nii,
+                fast_save=(not args.gzip),
                 match_intensity=args.match_intensity,
                 out_nii_raw=None,
             )
