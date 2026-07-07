@@ -45,7 +45,8 @@ rm -rf /tmp/notch-tools
 | 文件 | 说明 |
 |------|------|
 | `demo_denoise.py` | 单层 .npy 去噪；`init()` 后 `ema.to(device)` 修复 CUDA 错误 |
-| `denoise_nii.py` | 端到端 nii.gz → 去噪 → nii.gz + 每层 stats CSV |
+| `denoise_nii.py` | 单文件端到端 nii.gz → 去噪 → nii.gz + 每层 stats CSV |
+| `denoise_folder.py` | **批量**：输入文件夹内所有 .nii.gz 完整体积去噪 |
 | `convert_nii_to_npy.py` | nii 转 npy 辅助 |
 | `src/DADiff.py` | 支持 `DA-CLIP.pth` 回退路径 |
 
