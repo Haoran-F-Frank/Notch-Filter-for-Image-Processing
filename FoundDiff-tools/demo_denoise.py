@@ -75,7 +75,8 @@ def denoise_one(diffusion, x, device):
 
 
 def save_comparison(input_hu, denoised_norm, out_png):
-    denoised_hu = denoised_norm * 3000.0 - 1000.0
+  # Exact inverse of transforms.Normalize (NOT norm*3000-1000 which is off by 1024 HU)
+    denoised_hu = denoised_norm * 3000.0 + 24.0
     vmin, vmax = -160, 240
 
     fig, axes = plt.subplots(1, 2, figsize=(10, 5))

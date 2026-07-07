@@ -26,14 +26,23 @@ HU_MIN = -1000
 HU_MAX = 2000
 HU_RANGE = HU_MAX - HU_MIN  # 3000
 
+
+def hu_to_model_norm(hu_slice):
+    """Match data/transforms.Normalize: shift by -1024, then linear map to [0,1]."""
+    shifted = hu_slice.astype(np.float32) - HU_OFFSET
+    return np.clip((shifted - HU_MIN) / HU_RANGE, 0.0, 1.0)
+
+
+def model_norm_to_hu(norm_slice):
+    """Exact inverse of hu_to_model_norm / transforms.Normalize."""
+    shifted = norm_slice.astype(np.float32) * HU_RANGE + HU_MIN
+    return shifted + HU_OFFSET
+
+
 VAL_TRANSFORM = transforms.Compose([
     transforms.Normalize(min_value=HU_MIN, max_value=HU_MAX),
     transforms.ToTensor(expand_dims=False),
 ])
-
-
-def model_norm_to_hu(norm_slice):
-    return norm_slice.astype(np.float32) * HU_RANGE - 1000.0
 
 
 def slice_stats(arr):
@@ -262,7 +271,24 @@ def main():
 
     out_path = Path(args.out_nii)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    nib.save(nib.Nifti1Image(out_volume, affine), str(out_path))
+    out_img = nib.Nifti1Image(out_volume, affine, header=nii_in.header.copy())
+    out_img.set_data_dtype(np.float32)
+    nib.save(out_img, str(out_path))
+
+    # Sanity check: denoised slices should be on same HU scale as input
+    if processed > 0:
+        for row in rows:
+            if row.get('skipped'):
+                continue
+            z = row['slice']
+            orig = np.take(volume_hu, z, axis=args.axis)
+            out_sl = np.take(out_volume, z, axis=args.axis)
+            print(
+                f'Slice {z} HU check: input mean={orig.mean():.1f}, '
+                f'output mean={out_sl.mean():.1f}, '
+                f'delta={out_sl.mean() - orig.mean():.1f}'
+            )
+            break
 
     with open(stats_path, 'w', newline='') as f:
         if rows:
