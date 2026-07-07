@@ -1,20 +1,30 @@
-"""Shared HU <-> model [0,1] intensity mapping."""
+"""HU <-> model [0,1] intensity mapping.
+
+Input domain:  HU in [-2000, +1000]
+Model domain:  norm in [0, 1]
+Output domain: HU in [-2000, +1000]  (same as input)
+
+Forward:  norm = clip((hu + 2000) / 3000, 0, 1)
+Inverse:  hu   = clip(norm * 3000 - 2000, -2000, 1000)
+"""
 
 import numpy as np
 import torch
 
-# norm = clip((hu + 2000) / 3000, 0, 1)  ->  HU in [-2000, +1000]
-# hu   = norm * 3000 - 2000
-HU_ADD = 2000
-HU_RANGE = 3000
+HU_MIN = -2000
+HU_MAX = 1000
+HU_RANGE = HU_MAX - HU_MIN  # 3000
 
 
 def hu_to_model_norm(hu):
-    return np.clip((np.asarray(hu, dtype=np.float32) + HU_ADD) / HU_RANGE, 0.0, 1.0)
+    """[-2000, 1000] HU -> [0, 1]"""
+    return np.clip((np.asarray(hu, dtype=np.float32) - HU_MIN) / HU_RANGE, 0.0, 1.0)
 
 
 def model_norm_to_hu(norm):
-    return np.asarray(norm, dtype=np.float32) * HU_RANGE - HU_ADD
+    """[0, 1] -> [-2000, 1000] HU"""
+    hu = np.asarray(norm, dtype=np.float32) * HU_RANGE + HU_MIN
+    return np.clip(hu, HU_MIN, HU_MAX)
 
 
 def preprocess_hu_slice(hu_slice):

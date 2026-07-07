@@ -200,8 +200,8 @@ def main():
     parser.add_argument(
         '--match_intensity',
         choices=['none', 'slice', 'global'],
-        default='slice',
-        help='Linearly match denoised HU range to original: per-slice (default) or global',
+        default='none',
+        help='Optional extra linear match to input min/max. Default none: use formula [0,1]->[-2000,1000] only',
     )
     parser.add_argument(
         '--out_nii_raw',
