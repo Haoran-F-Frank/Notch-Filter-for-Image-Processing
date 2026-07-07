@@ -1,0 +1,481 @@
+diff --git a/convert_nii_to_npy.py b/convert_nii_to_npy.py
+new file mode 100644
+index 0000000..16c56d9
+--- /dev/null
++++ b/convert_nii_to_npy.py
+@@ -0,0 +1,74 @@
++#!/usr/bin/env python3
++"""Convert a NIfTI volume to 512x512 .npy slices for FoundDiff."""
++
++import argparse
++from pathlib import Path
++
++import numpy as np
++import SimpleITK as sitk
++from skimage.transform import resize
++
++
++def load_volume(nii_path):
++    image = sitk.ReadImage(str(nii_path))
++    arr = sitk.GetArrayFromImage(image).astype(np.float32)
++    return arr
++
++
++def to_hu(arr):
++    """Keep values as HU if they already look like CT; otherwise return as-is."""
++    if arr.min() >= 0 and arr.max() <= 1.0:
++        return arr * 3000.0 - 1000.0
++    return arr
++
++
++def resize_slice(slice_2d, size=512):
++    return resize(
++        slice_2d,
++        (size, size),
++        order=1,
++        preserve_range=True,
++        anti_aliasing=True,
++    ).astype(np.float32)
++
++
++def main():
++    parser = argparse.ArgumentParser(description='Convert NIfTI to FoundDiff .npy slices')
++    parser.add_argument('--nii', required=True, help='Input .nii or .nii.gz path')
++    parser.add_argument('--out_dir', required=True, help='Output directory for .npy files')
++    parser.add_argument('--prefix', default='slice', help='Output filename prefix')
++    parser.add_argument('--size', type=int, default=512, help='Output spatial size')
++    parser.add_argument(
++        '--pick_best',
++        action='store_true',
++        help='Save only the slice with the highest mean HU (usually best anatomy)',
++    )
++    args = parser.parse_args()
++
++    volume = to_hu(load_volume(args.nii))
++    out_dir = Path(args.out_dir)
++    out_dir.mkdir(parents=True, exist_ok=True)
++
++    best_idx, best_mean = 0, volume[0].mean()
++    for z in range(volume.shape[0]):
++        sl = resize_slice(volume[z], size=args.size)
++        mean_hu = float(sl.mean())
++        print(f'z={z:04d}: mean={mean_hu:.2f}, min={sl.min():.2f}, max={sl.max():.2f}')
++        if mean_hu > best_mean:
++            best_idx, best_mean = z, mean_hu
++
++        if not args.pick_best:
++            out_path = out_dir / f'{args.prefix}-{z:04d}.npy'
++            np.save(out_path, sl)
++
++    if args.pick_best:
++        sl = resize_slice(volume[best_idx], size=args.size)
++        out_path = out_dir / f'{args.prefix}-best-{best_idx:04d}.npy'
++        np.save(out_path, sl)
++        print(f'Saved best slice z={best_idx} (mean={best_mean:.2f}) -> {out_path}')
++    else:
++        print(f'Saved {volume.shape[0]} slices to {out_dir}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/demo_denoise.py b/demo_denoise.py
+new file mode 100644
+index 0000000..3ea5de8
+--- /dev/null
++++ b/demo_denoise.py
+@@ -0,0 +1,143 @@
++#!/usr/bin/env python3
++"""Run FoundDiff denoising on a single .npy CT slice."""
++
++import argparse
++from pathlib import Path
++
++import matplotlib.pyplot as plt
++import numpy as np
++import torch
++from ema_pytorch import EMA
++
++from data import transforms
++from src.DADiff import ResidualDiffusion, UnetRes, set_seed
++
++
++def build_model(checkpoint_path, device):
++    """Load EMA weights and prepare the model for inference."""
++    model = UnetRes(
++        dim=64,
++        dim_mults=(1, 2, 4, 8),
++        num_unet=1,
++        condition=True,
++        input_condition=False,
++        objective='pred_res',
++        test_res_or_noise='res',
++    )
++    diffusion = ResidualDiffusion(
++        model,
++        image_size=512,
++        timesteps=1000,
++        sampling_timesteps=2,
++        objective='pred_res',
++        loss_type='l2',
++        condition=True,
++        sum_scale=0.01,
++        input_condition=False,
++        input_condition_mask=False,
++        test_res_or_noise='res',
++    )
++
++    print(f'Loading FoundDiff checkpoint: {checkpoint_path}')
++    ckpt = torch.load(checkpoint_path, map_location='cpu')
++    ema = EMA(diffusion, beta=0.995, update_every=10)
++    ema.load_state_dict(ckpt['ema'])
++
++    # init() rebuilds diffusion schedule buffers on CPU; move to GPU after init.
++    ema.ema_model.init()
++    ema.to(device)
++    ema.ema_model.eval()
++    print('FoundDiff EMA model loaded.')
++    return ema.ema_model
++
++
++def load_npy_slice(npy_path):
++    """Load and preprocess a CT slice using the same transforms as validation."""
++    arr = np.load(npy_path).astype(np.float32)
++    if arr.ndim == 2:
++        arr = np.expand_dims(arr, axis=0)
++
++    val_transform = transforms.Compose([
++        transforms.Normalize(min_value=-1000, max_value=2000),
++        transforms.ToTensor(expand_dims=False),
++    ])
++    tensor = val_transform(arr)
++    if tensor.ndim == 2:
++        tensor = tensor.unsqueeze(0)
++    return tensor.unsqueeze(0)
++
++
++@torch.no_grad()
++def denoise_one(diffusion, x, device):
++    x_in = x.to(device)
++    out = diffusion.sample([x_in], batch_size=1, last=True)
++    return out[-1].squeeze(0).squeeze(0).cpu().numpy()
++
++
++def save_comparison(input_hu, denoised_norm, out_png):
++    denoised_hu = denoised_norm * 3000.0 - 1000.0
++    vmin, vmax = -160, 240
++
++    fig, axes = plt.subplots(1, 2, figsize=(10, 5))
++    axes[0].imshow(input_hu, cmap='gray', vmin=vmin, vmax=vmax)
++    axes[0].set_title('Input (HU)')
++    axes[0].axis('off')
++
++    axes[1].imshow(denoised_hu, cmap='gray', vmin=vmin, vmax=vmax)
++    axes[1].set_title('Denoised (HU)')
++    axes[1].axis('off')
++
++    fig.tight_layout()
++    fig.savefig(out_png, dpi=150, bbox_inches='tight')
++    plt.close(fig)
++
++
++def main():
++    parser = argparse.ArgumentParser(description='FoundDiff single-slice denoising demo')
++    parser.add_argument('--npy', required=True, help='Input .npy slice (HU values, 512x512)')
++    parser.add_argument('--out_npy', required=True, help='Output denoised .npy path')
++    parser.add_argument('--out_png', required=True, help='Output side-by-side comparison PNG')
++    parser.add_argument(
++        '--checkpoint',
++        default='checkpoints/FoundDiff/sample/model-400.pt',
++        help='FoundDiff checkpoint path',
++    )
++    args = parser.parse_args()
++
++    set_seed(10)
++    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    print(f'Using device: {device}')
++
++    input_hu = np.load(args.npy).astype(np.float32)
++    print(
++        f'Input stats: shape={input_hu.shape}, '
++        f'min={input_hu.min():.4f}, max={input_hu.max():.4f}, mean={input_hu.mean():.4f}'
++    )
++    if input_hu.mean() < -900:
++        print(
++            'WARNING: input mean is near -1000 HU (mostly air). '
++            'Pick a slice with visible anatomy (mean roughly -800 to -200).'
++        )
++
++    diffusion = build_model(args.checkpoint, device)
++    x = load_npy_slice(args.npy)
++    denoised_norm = denoise_one(diffusion, x, device)
++
++    out_npy = Path(args.out_npy)
++    out_npy.parent.mkdir(parents=True, exist_ok=True)
++    np.save(out_npy, denoised_norm.astype(np.float32))
++
++    out_png = Path(args.out_png)
++    out_png.parent.mkdir(parents=True, exist_ok=True)
++    save_comparison(input_hu, denoised_norm, out_png)
++
++    print(
++        f'Output stats: min={denoised_norm.min():.6f}, '
++        f'max={denoised_norm.max():.6f}, mean={denoised_norm.mean():.6f}'
++    )
++    print(f'Saved denoised npy: {out_npy}')
++    print(f'Saved comparison png: {out_png}')
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/denoise_nii.py b/denoise_nii.py
+new file mode 100644
+index 0000000..2f5ac5f
+--- /dev/null
++++ b/denoise_nii.py
+@@ -0,0 +1,228 @@
++#!/usr/bin/env python3
++"""
++End-to-end FoundDiff denoising: NIfTI -> process in memory -> NIfTI.
++
++Intermediate .npy files are NOT required. This script:
++  1. reads a .nii/.nii.gz volume (HU values),
++  2. resizes each slice to 512x512, applies the official linear HU transform,
++  3. runs FoundDiff denoising,
++  4. converts back to HU with the inverse linear transform,
++  5. writes a new NIfTI and a per-slice stats CSV (min/max/mean).
++"""
++
++import argparse
++import csv
++from pathlib import Path
++
++import nibabel as nib
++import numpy as np
++import torch
++from ema_pytorch import EMA
++from skimage.transform import resize
++from tqdm import tqdm
++
++from data import transforms
++from src.DADiff import ResidualDiffusion, UnetRes, set_seed
++
++# Official FoundDiff linear transforms (fixed HU window, NOT per-slice min-max).
++HU_OFFSET = 1024
++HU_MIN = -1000
++HU_MAX = 2000
++HU_RANGE = HU_MAX - HU_MIN  # 3000
++
++
++def hu_to_model_norm(hu_slice):
++    """HU -> [0, 1] using the same formula as data/transforms.Normalize."""
++    m = hu_slice.astype(np.float32) - HU_OFFSET
++    return np.clip((m - HU_MIN) / HU_RANGE, 0.0, 1.0)
++
++
++def model_norm_to_hu(norm_slice):
++    """[0, 1] -> HU (inverse of official test post-processing)."""
++    return norm_slice.astype(np.float32) * HU_RANGE - 1000.0
++
++
++def slice_stats(arr, name):
++    return {
++        'name': name,
++        'min': float(np.min(arr)),
++        'max': float(np.max(arr)),
++        'mean': float(np.mean(arr)),
++    }
++
++
++def build_model(checkpoint_path, device):
++    model = UnetRes(
++        dim=64,
++        dim_mults=(1, 2, 4, 8),
++        num_unet=1,
++        condition=True,
++        input_condition=False,
++        objective='pred_res',
++        test_res_or_noise='res',
++    )
++    diffusion = ResidualDiffusion(
++        model,
++        image_size=512,
++        timesteps=1000,
++        sampling_timesteps=2,
++        objective='pred_res',
++        loss_type='l2',
++        condition=True,
++        sum_scale=0.01,
++        input_condition=False,
++        input_condition_mask=False,
++        test_res_or_noise='res',
++    )
++
++    print(f'Loading FoundDiff checkpoint: {checkpoint_path}')
++    ckpt = torch.load(checkpoint_path, map_location='cpu')
++    ema = EMA(diffusion, beta=0.995, update_every=10)
++    ema.load_state_dict(ckpt['ema'])
++    ema.ema_model.init()
++    ema.to(device)
++    ema.ema_model.eval()
++    print('FoundDiff EMA model loaded.')
++    return ema.ema_model
++
++
++def preprocess_slice(hu_slice, size=512):
++    """Resize to model size and build a (1, 1, H, W) tensor."""
++    resized = resize(
++        hu_slice,
++        (size, size),
++        order=1,
++        preserve_range=True,
++        anti_aliasing=True,
++    ).astype(np.float32)
++
++    arr = np.expand_dims(resized, axis=0)  # (1, H, W) for transforms
++    val_transform = transforms.Compose([
++        transforms.Normalize(min_value=HU_MIN, max_value=HU_MAX),
++        transforms.ToTensor(expand_dims=False),
++    ])
++    tensor = val_transform(arr)
++    if tensor.ndim == 2:
++        tensor = tensor.unsqueeze(0)
++    return tensor.unsqueeze(0), resized.shape
++
++
++@torch.no_grad()
++def denoise_tensor(diffusion, tensor, device):
++    x_in = tensor.to(device)
++    out = diffusion.sample([x_in], batch_size=1, last=True)
++    return out[-1].squeeze(0).squeeze(0).cpu().numpy()
++
++
++def resize_back(slice_2d, out_shape):
++    return resize(
++        slice_2d,
++        out_shape,
++        order=1,
++        preserve_range=True,
++        anti_aliasing=True,
++    ).astype(np.float32)
++
++
++def iter_slices(volume, axis):
++    """Yield (index, 2d_slice, insert_axis) for each slice along `axis`."""
++    for i in range(volume.shape[axis]):
++        sl = np.take(volume, i, axis=axis)
++        yield i, sl
++
++
++def insert_slice(volume, axis, index, slice_2d):
++    idx = [slice(None)] * volume.ndim
++    idx[axis] = index
++    volume[tuple(idx)] = slice_2d
++
++
++def main():
++    parser = argparse.ArgumentParser(
++        description='FoundDiff end-to-end NIfTI denoising (no intermediate .npy needed)'
++    )
++    parser.add_argument('--in_nii', required=True, help='Input .nii or .nii.gz (HU values)')
++    parser.add_argument('--out_nii', required=True, help='Output denoised .nii.gz')
++    parser.add_argument('--stats_csv', default=None, help='Per-slice stats CSV (default: <out_nii>.stats.csv)')
++    parser.add_argument('--checkpoint', default='checkpoints/FoundDiff/sample/model-400.pt')
++    parser.add_argument('--axis', type=int, default=2, help='Slice axis in the volume (default: 2)')
++    parser.add_argument('--z_start', type=int, default=None, help='First slice index (inclusive)')
++    parser.add_argument('--z_end', type=int, default=None, help='Last slice index (exclusive)')
++    parser.add_argument('--skip_air', action='store_true', help='Skip slices with mean HU < -900')
++    parser.add_argument('--size', type=int, default=512, help='Model input size')
++    args = parser.parse_args()
++
++    set_seed(10)
++    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
++    print(f'Using device: {device}')
++
++    nii_in = nib.load(args.in_nii)
++    volume_hu = nii_in.get_fdata().astype(np.float32)
++    affine = nii_in.affine.copy()
++    print(f'Input volume shape: {volume_hu.shape}, dtype float32 HU')
++
++    z_start = args.z_start if args.z_start is not None else 0
++    z_end = args.z_end if args.z_end is not None else volume_hu.shape[args.axis]
++    z_end = min(z_end, volume_hu.shape[args.axis])
++
++    out_volume = np.zeros_like(volume_hu, dtype=np.float32)
++    diffusion = build_model(args.checkpoint, device)
++
++    stats_path = args.stats_csv or (str(args.out_nii) + '.stats.csv')
++    rows = []
++
++    for z in tqdm(range(z_start, z_end), desc='denoising slices'):
++        sl_hu = np.take(volume_hu, z, axis=args.axis)
++        in_stat = slice_stats(sl_hu, 'input_hu')
++
++        if args.skip_air and in_stat['mean'] < -900:
++            insert_slice(out_volume, args.axis, z, sl_hu)
++            rows.append({'slice': z, 'skipped': True, **{f'in_{k}': v for k, v in in_stat.items() if k != 'name'}})
++            continue
++
++        tensor, _ = preprocess_slice(sl_hu, size=args.size)
++        denoised_norm = denoise_tensor(diffusion, tensor, device)
++        denoised_hu_512 = model_norm_to_hu(denoised_norm)
++        denoised_hu = resize_back(denoised_hu_512, sl_hu.shape)
++        insert_slice(out_volume, args.axis, z, denoised_hu)
++
++        out_stat = slice_stats(denoised_hu, 'output_hu')
++        rows.append({
++            'slice': z,
++            'skipped': False,
++            'in_min': in_stat['min'],
++            'in_max': in_stat['max'],
++            'in_mean': in_stat['mean'],
++            'out_min': out_stat['min'],
++            'out_max': out_stat['max'],
++            'out_mean': out_stat['mean'],
++            'norm_min': float(denoised_norm.min()),
++            'norm_max': float(denoised_norm.max()),
++            'norm_mean': float(denoised_norm.mean()),
++        })
++
++    # Copy slices outside [z_start, z_end) unchanged
++    for z in list(range(0, z_start)) + list(range(z_end, volume_hu.shape[args.axis])):
++        insert_slice(out_volume, args.axis, z, np.take(volume_hu, z, axis=args.axis))
++
++    out_path = Path(args.out_nii)
++    out_path.parent.mkdir(parents=True, exist_ok=True)
++    nib.save(nib.Nifti1Image(out_volume, affine), str(out_path))
++
++    with open(stats_path, 'w', newline='') as f:
++        if rows:
++            writer = csv.DictWriter(f, fieldnames=rows[0].keys())
++            writer.writeheader()
++            writer.writerows(rows)
++
++    print(f'Saved denoised NIfTI: {out_path}')
++    print(f'Saved per-slice stats: {stats_path}')
++    print(
++        'Linear transforms used:\n'
++        f'  HU -> model: norm = clip((hu - {HU_OFFSET} - ({HU_MIN})) / {HU_RANGE}, 0, 1)\n'
++        f'  model -> HU: hu = norm * {HU_RANGE} - 1000'
++    )
++
++
++if __name__ == '__main__':
++    main()
+diff --git a/src/DADiff.py b/src/DADiff.py
+index 5912e12..fd0abaa 100644
+--- a/src/DADiff.py
++++ b/src/DADiff.py
+@@ -592,7 +592,12 @@ class Unet(nn.Module):
+                 param.requires_grad = False
+ 
+             clipiqa=CLIPIQA(model_type='clipiqa+')
+-            state_dict=torch.load('Dose-CLIP.pth', map_location='cpu')
++            clip_path = 'Dose-CLIP.pth' if os.path.exists('Dose-CLIP.pth') else 'DA-CLIP.pth'
++            if not os.path.exists(clip_path):
++                raise FileNotFoundError(
++                    'DA-CLIP weights not found. Place Dose-CLIP.pth or DA-CLIP.pth in the repo root.'
++                )
++            state_dict=torch.load(clip_path, map_location='cpu')
+             clipiqa.load_state_dict(state_dict, strict=True)
+             self.dose_encoder=clipiqa
+             for param in self.dose_encoder.parameters():
