@@ -8,6 +8,7 @@ Typical speed on GPU: ~20-30 sec/slice (batch_size=1). Use --batch_size 2 or 4 i
 
 import argparse
 import csv
+import sys
 import time
 from pathlib import Path
 
@@ -142,6 +143,17 @@ def insert_slice(volume, axis, index, slice_2d):
     volume[tuple(idx)] = slice_2d
 
 
+def copy_volume_range(dst, src, axis, z_start, z_end):
+    """Bulk-copy a contiguous slice range (much faster than per-slice loop)."""
+    idx = [slice(None)] * dst.ndim
+    idx[axis] = slice(z_start, z_end)
+    dst[tuple(idx)] = src[tuple(idx)]
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
 def warmup_gpu(diffusion, device, size=512):
     dummy = torch.zeros(1, 1, size, size)
     denoise_batch(diffusion, dummy, device)
@@ -163,6 +175,16 @@ def main():
     parser.add_argument('--skip_air', action='store_true', help='Skip slices with mean HU < -900')
     parser.add_argument('--size', type=int, default=512, help='Model input size')
     parser.add_argument('--batch_size', type=int, default=1, help='Slices per GPU forward pass (try 2 or 4)')
+    parser.add_argument(
+        '--subset_only',
+        action='store_true',
+        help='Save only processed slices [z_start:z_end] (small file, fast for testing)',
+    )
+    parser.add_argument(
+        '--fast_save',
+        action='store_true',
+        help='Save uncompressed .nii instead of .nii.gz (much faster write)',
+    )
     args = parser.parse_args()
 
     if not Path(args.in_nii).exists():
@@ -255,9 +277,23 @@ def main():
 
     flush_batch()
     pbar.close()
+    log('Denoising done. Assembling output volume...')
 
-    for z in list(range(0, z_start)) + list(range(z_end, volume_hu.shape[args.axis])):
-        insert_slice(out_volume, args.axis, z, np.take(volume_hu, z, axis=args.axis))
+    if args.subset_only:
+        idx = [slice(None)] * out_volume.ndim
+        idx[args.axis] = slice(z_start, z_end)
+        out_to_save = out_volume[tuple(idx)].copy()
+        affine_out = affine.copy()
+        log(f'Subset mode: saving {out_to_save.shape} (slices {z_start}:{z_end} only)')
+    else:
+        out_to_save = out_volume
+        affine_out = affine
+        if z_start > 0:
+            log(f'Copying unchanged slices 0:{z_start}...')
+            copy_volume_range(out_volume, volume_hu, args.axis, 0, z_start)
+        if z_end < volume_hu.shape[args.axis]:
+            log(f'Copying unchanged slices {z_end}:{volume_hu.shape[args.axis]}...')
+            copy_volume_range(out_volume, volume_hu, args.axis, z_end, volume_hu.shape[args.axis])
 
     elapsed = time.time() - t0
     if processed > 0:
@@ -270,10 +306,19 @@ def main():
         )
 
     out_path = Path(args.out_nii)
+    if args.fast_save and str(out_path).endswith('.gz'):
+        out_path = Path(str(out_path)[:-3])  # .nii.gz -> .nii
+        log(f'fast_save: writing uncompressed {out_path}')
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_img = nib.Nifti1Image(out_volume, affine, header=nii_in.header.copy())
+
+    mb = out_to_save.nbytes / (1024 * 1024)
+    log(f'Saving NIfTI ({mb:.0f} MB raw) -> {out_path} ...')
+    log('(gzip .nii.gz can take 10-30+ min for full volumes; use --fast_save or --subset_only for tests)')
+    t_save = time.time()
+    out_img = nib.Nifti1Image(out_to_save.astype(np.float32), affine_out, header=nii_in.header.copy())
     out_img.set_data_dtype(np.float32)
     nib.save(out_img, str(out_path))
+    log(f'NIfTI saved in {time.time() - t_save:.1f} s')
 
     # Sanity check: denoised slices should be on same HU scale as input
     if processed > 0:
@@ -283,7 +328,7 @@ def main():
             z = row['slice']
             orig = np.take(volume_hu, z, axis=args.axis)
             out_sl = np.take(out_volume, z, axis=args.axis)
-            print(
+            log(
                 f'Slice {z} HU check: input mean={orig.mean():.1f}, '
                 f'output mean={out_sl.mean():.1f}, '
                 f'delta={out_sl.mean() - orig.mean():.1f}'
@@ -296,8 +341,9 @@ def main():
             writer.writeheader()
             writer.writerows(rows)
 
-    print(f'Saved denoised NIfTI: {out_path}')
-    print(f'Saved per-slice stats: {stats_path}')
+    log(f'Saved denoised NIfTI: {out_path}')
+    log(f'Saved per-slice stats: {stats_path}')
+    log('All done.')
 
 
 if __name__ == '__main__':
